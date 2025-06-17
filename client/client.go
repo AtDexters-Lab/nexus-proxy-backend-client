@@ -156,7 +156,8 @@ func (c *Client) handleControlMessage(payload []byte) {
 	var msg struct {
 		Event    string    `json:"event"`
 		ClientID uuid.UUID `json:"client_id"`
-		DestPort int       `json:"dest_port"`
+		ConnPort int       `json:"conn_port"` // Port on which the client is connecting
+		ClientIP string    `json:"client_ip"` // Optional field for future use
 	}
 	if err := json.Unmarshal(payload, &msg); err != nil {
 		log.Printf("WARN: [%s] Failed to unmarshal control message: %v", c.config.Name, err)
@@ -165,13 +166,13 @@ func (c *Client) handleControlMessage(payload []byte) {
 
 	switch msg.Event {
 	case "connect":
-		localAddr, ok := c.config.PortMappings[msg.DestPort]
+		localAddr, ok := c.config.PortMappings[msg.ConnPort]
 		if !ok {
-			log.Printf("ERROR: [%s] Received connect for unmapped destination port %d. Ignoring.", c.config.Name, msg.DestPort)
+			log.Printf("ERROR: [%s] Received connect for unmapped destination port %d. Ignoring.", c.config.Name, msg.ConnPort)
 			return
 		}
 
-		log.Printf("INFO: [%s] Received 'connect' for ClientID %s on port %d. Dialing local service at %s", c.config.Name, msg.ClientID, msg.DestPort, localAddr)
+		log.Printf("INFO: [%s] Received 'connect' for ClientID %s on port %d. Dialing local service at %s", c.config.Name, msg.ClientID, msg.ConnPort, localAddr)
 
 		conn, err := net.Dial("tcp", localAddr)
 		if err != nil {
