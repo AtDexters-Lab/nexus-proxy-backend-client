@@ -137,6 +137,7 @@ func (c *Client) readPump() {
 		}
 
 		if msgType != websocket.BinaryMessage || len(p) < 1 {
+			log.Printf("ERROR: [%s] Received non-binary message or too short payload: %d bytes", c.config.Name, len(p))
 			continue
 		}
 
@@ -148,6 +149,8 @@ func (c *Client) readPump() {
 			c.handleControlMessage(payload)
 		case controlByteData:
 			c.handleDataMessage(payload)
+		default:
+			log.Printf("ERROR: [%s] Received unknown control byte: %d", c.config.Name, controlByte)
 		}
 	}
 }
@@ -220,14 +223,18 @@ func (c *Client) handleDataMessage(payload []byte) {
 	copy(clientID[:], payload[:clientIDLength])
 	data := payload[clientIDLength:]
 
-	if val, ok := c.localConns.Load(clientID); ok {
+	val, ok := c.localConns.Load(clientID)
+	if ok {
 		if conn, ok := val.(*clientConn); ok {
 			conn.lastActivity.Store(time.Now().Unix()) // Reset activity timer
 			_, err := conn.conn.Write(data)
 			if err != nil {
 				conn.conn.Close()
+				log.Printf("ERROR: [%s] Failed to write data to local connection for ClientID %s: %v", c.config.Name, clientID, err)
 			}
 		}
+	} else {
+		log.Printf("WARN: [%s] No local connection found for ClientID %s. Data will be dropped.", c.config.Name, clientID)
 	}
 }
 

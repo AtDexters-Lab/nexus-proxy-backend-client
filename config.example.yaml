@@ -1,0 +1,27 @@
+backends:
+  - # A friendly name for this configuration block.
+    name: "webapp"
+    # The public-facing hostname this backend is responsible for.
+    hostname: "app.example.com"
+    # The WebSocket address of the Nexus Proxy server.
+    nexusAddress: "wss://nexus.example.com/connect"
+    # The full, pre-signed JWT obtained from a central authorizer.
+    authToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+    # A map of public-facing relay ports on Nexus to local service ports.
+    portMappings:
+      443: "localhost:8443" # Relay HTTPS traffic to a local web server
+      80: "localhost:8080" # Relay HTTP traffic
+    # Configuration for active client health checks.
+    healthChecks:
+      # Enable active health checks. Recommended.
+      enabled: true
+      # Time in seconds a connection can be idle before a ping is sent.
+      inactivityTimeout: 60
+      # Time in seconds to wait for a pong from the proxy after a ping is sent.
+      pongTimeout: 5
+  - name: "email-server"
+    hostname: "imap.example.com"
+    nexusAddress: "wss://nexus.example.com/connect"
+    authToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+    portMappings:
+      993: "localhost:993" # Relay secure IMAP (IMAPS) traffic
