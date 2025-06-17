@@ -45,12 +45,12 @@ backends:
       # Time in seconds to wait for a pong from the proxy after a ping is sent.
       pongTimeout: 5
   -
-    name: "ssh-gateway"
-    hostname: "ssh.example.com"
+    name: "email-server"
+    hostname: "imap.example.com"
     nexusAddress: "wss://nexus.example.com/connect"
     authToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
     portMappings:
-      22: "localhost:2222"  # Relay SSH traffic
+      993: "localhost:993"  # Relay secure IMAP (IMAPS) traffic
 ```
 
 ### Example Usage

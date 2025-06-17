@@ -29,11 +29,11 @@ func main() {
 	// Create and start a client instance for each configured backend.
 	for _, backendCfg := range cfg.Backends {
 		wg.Add(1)
-		c := client.New(backendCfg)
-		go func() {
+		go func(cfg client.BackendConfig) {
 			defer wg.Done()
+			c := client.New(cfg)
 			c.Start(ctx)
-		}()
+		}(backendCfg)
 	}
 
 	// Wait for shutdown signal.
