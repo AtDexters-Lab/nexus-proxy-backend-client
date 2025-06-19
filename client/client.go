@@ -94,7 +94,7 @@ func (c *Client) connectAndAuthenticate() error {
 	c.wsMu.Lock()
 	defer c.wsMu.Unlock()
 
-	ws, _, err := websocket.DefaultDialer.Dial(c.config.NexusAddress, nil)
+	ws, _, err := websocket.DefaultDialer.DialContext(c.ctx, c.config.NexusAddress, nil)
 	if err != nil {
 		return fmt.Errorf("dial failed: %w", err)
 	}
@@ -125,32 +125,57 @@ func (c *Client) readPump() {
 	defer ws.Close()
 
 	for {
-		msgType, p, err := ws.ReadMessage()
-		if err != nil {
+		// Create a channel to receive the message from a goroutine
+		msgChan := make(chan []byte)
+		errChan := make(chan error)
+
+		go func() {
+			if ws == nil {
+				errChan <- fmt.Errorf("connection is nil")
+				return
+			}
+			msgType, msg, err := ws.ReadMessage()
+			if err != nil {
+				errChan <- err
+				return
+			}
+			if msgType != websocket.BinaryMessage || len(msg) < 1 {
+				errChan <- fmt.Errorf("[%s] Received non-binary message or too short payload: %d bytes", c.config.Name, len(msg))
+				return
+			}
+
+			msgChan <- msg
+		}()
+
+		select {
+		case <-c.ctx.Done():
+			// Context was canceled, time to shut down.
+			log.Println("readLoop: context done, closing connection.")
+			return // Exit the loop
+
+		case err := <-errChan:
+			// An error occurred during ReadMessage.
 			select {
 			case <-c.ctx.Done():
 				return
 			default:
 				log.Printf("ERROR: [%s] Error reading from Nexus: %v", c.config.Name, err)
 			}
-			return
-		}
+			return // Exit the loop
 
-		if msgType != websocket.BinaryMessage || len(p) < 1 {
-			log.Printf("ERROR: [%s] Received non-binary message or too short payload: %d bytes", c.config.Name, len(p))
-			continue
-		}
+		case msg := <-msgChan:
+			// We received a message. Process it.
+			controlByte := msg[0]
+			payload := msg[1:]
 
-		controlByte := p[0]
-		payload := p[1:]
-
-		switch controlByte {
-		case controlByteControl:
-			c.handleControlMessage(payload)
-		case controlByteData:
-			c.handleDataMessage(payload)
-		default:
-			log.Printf("ERROR: [%s] Received unknown control byte: %d", c.config.Name, controlByte)
+			switch controlByte {
+			case controlByteControl:
+				c.handleControlMessage(payload)
+			case controlByteData:
+				c.handleDataMessage(payload)
+			default:
+				log.Printf("ERROR: [%s] Received unknown control byte: %d", c.config.Name, controlByte)
+			}
 		}
 	}
 }
