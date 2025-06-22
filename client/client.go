@@ -57,6 +57,9 @@ func (c *Client) Start(ctx context.Context) {
 
 	log.Printf("INFO: [%s] Manager started for hostname: %s", c.config.Name, c.config.Hostname)
 
+	// Start the health check pump to monitor connection health.
+	go c.healthCheckPump()
+
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -73,9 +76,8 @@ func (c *Client) Start(ctx context.Context) {
 
 		log.Printf("INFO: [%s] Connection established and authenticated. Starting pumps.", c.config.Name)
 
-		c.wg.Add(2)
+		c.wg.Add(1)
 		go c.readPump()
-		go c.healthCheckPump()
 
 		c.wg.Wait() // Wait for pumps to exit, indicating a disconnection.
 		log.Printf("INFO: [%s] Disconnected from Nexus Proxy.", c.config.Name)
@@ -216,7 +218,7 @@ func (c *Client) handleControlMessage(payload []byte) {
 		newClient.lastActivity.Store(time.Now().Unix())
 		c.localConns.Store(msg.ClientID, newClient)
 
-		go c.copyToNexus(newClient)
+		go c.copyLocalToNexus(newClient)
 
 	case "disconnect":
 		log.Printf("INFO: [%s] Received 'disconnect' for ClientID: %s. Closing local connection.", c.config.Name, msg.ClientID)
@@ -263,7 +265,7 @@ func (c *Client) handleDataMessage(payload []byte) {
 	}
 }
 
-func (c *Client) copyToNexus(client *clientConn) {
+func (c *Client) copyLocalToNexus(client *clientConn) {
 	defer func() {
 		client.conn.Close()
 		c.localConns.Delete(client.id)
@@ -272,7 +274,7 @@ func (c *Client) copyToNexus(client *clientConn) {
 		c.sendControlMessage("disconnect", client.id)
 	}()
 
-	buf := make([]byte, 8192)
+	buf := make([]byte, 16384) // 16KB buffer for reading data - The server specifies a maximum read size of 32KB + 17 bytes for the header, so 16KB is a safe size.
 	for {
 		select {
 		case <-client.quit:
@@ -304,7 +306,6 @@ func (c *Client) copyToNexus(client *clientConn) {
 }
 
 func (c *Client) healthCheckPump() {
-	defer c.wg.Done()
 	if !c.config.HealthChecks.Enabled {
 		return
 	}
