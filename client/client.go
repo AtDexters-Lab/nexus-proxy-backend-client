@@ -261,7 +261,8 @@ func (c *Client) handleDataMessage(payload []byte) {
 			}
 		}
 	} else {
-		log.Printf("WARN: [%s] No local connection found for ClientID %s. Data will be dropped.", c.config.Name, clientID)
+		log.Printf("WARN: [%s] No local connection found for ClientID %s. Data will be dropped. Disconnect will be sent to proxy", c.config.Name, clientID)
+		c.sendControlMessage("disconnect", clientID)
 	}
 }
 
