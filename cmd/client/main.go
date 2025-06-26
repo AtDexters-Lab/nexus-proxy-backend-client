@@ -28,12 +28,21 @@ func main() {
 
 	// Create and start a client instance for each configured backend.
 	for _, backendCfg := range cfg.Backends {
-		wg.Add(1)
-		go func(cfg client.BackendConfig) {
-			defer wg.Done()
-			c := client.New(cfg)
-			c.Start(ctx)
-		}(backendCfg)
+		for _, nexusAddr := range backendCfg.NexusAddresses {
+			wg.Add(1)
+			go func(cfg client.ClientBackendConfig) {
+				defer wg.Done()
+				c := client.New(cfg)
+				c.Start(ctx)
+			}(client.ClientBackendConfig{
+				Name:         backendCfg.Name,
+				Hostname:     backendCfg.Hostname,
+				NexusAddress: nexusAddr,
+				AuthToken:    backendCfg.AuthToken,
+				PortMappings: backendCfg.PortMappings,
+				HealthChecks: backendCfg.HealthChecks,
+			})
+		}
 	}
 
 	// Wait for shutdown signal.

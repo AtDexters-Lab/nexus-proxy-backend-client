@@ -3,8 +3,10 @@ backends:
     name: "webapp"
     # The public-facing hostname this backend is responsible for.
     hostname: "app.example.com"
-    # The WebSocket address of the Nexus Proxy server.
-    nexusAddress: "wss://nexus.example.com/connect"
+    # The WebSocket address of the Nexus Proxy servers.
+    nexusAddresses:
+      - "wss://nexus-1.example.com/connect"
+      - "wss://nexus-2.example.com/connect"
     # The full, pre-signed JWT obtained from a central authorizer.
     authToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
     # A map of public-facing relay ports on Nexus to local service ports.

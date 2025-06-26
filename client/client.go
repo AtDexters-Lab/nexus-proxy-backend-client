@@ -38,9 +38,18 @@ type clientConn struct {
 	quit         chan struct{}
 }
 
+type ClientBackendConfig struct {
+	Name         string
+	Hostname     string
+	NexusAddress string
+	AuthToken    string
+	PortMappings map[int]string
+	HealthChecks HealthCheckConfig
+}
+
 // Client manages the full lifecycle for one configured backend service.
 type Client struct {
-	config     BackendConfig
+	config     ClientBackendConfig
 	ws         *websocket.Conn
 	wsMu       sync.Mutex
 	localConns sync.Map
@@ -51,7 +60,7 @@ type Client struct {
 }
 
 // New creates a new Client instance for a specific backend configuration.
-func New(cfg BackendConfig) *Client {
+func New(cfg ClientBackendConfig) *Client {
 	return &Client{
 		config: cfg,
 		send:   make(chan []byte, 256), // Buffered channel to handle outgoing messages

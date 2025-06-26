@@ -18,12 +18,12 @@ type HealthCheckConfig struct {
 }
 
 type BackendConfig struct {
-	Name         string            `yaml:"name"`
-	Hostname     string            `yaml:"hostname"`
-	NexusAddress string            `yaml:"nexusAddress"`
-	AuthToken    string            `yaml:"authToken"`
-	PortMappings map[int]string    `yaml:"portMappings"`
-	HealthChecks HealthCheckConfig `yaml:"healthChecks"`
+	Name           string            `yaml:"name"`
+	Hostname       string            `yaml:"hostname"`
+	NexusAddresses []string          `yaml:"nexusAddresses"`
+	AuthToken      string            `yaml:"authToken"`
+	PortMappings   map[int]string    `yaml:"portMappings"`
+	HealthChecks   HealthCheckConfig `yaml:"healthChecks"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -49,8 +49,8 @@ func LoadConfig(path string) (*Config, error) {
 		if b.Hostname == "" {
 			return nil, fmt.Errorf("backend '%s': hostname is required", b.Name)
 		}
-		if b.NexusAddress == "" {
-			return nil, fmt.Errorf("backend '%s': nexusAddress is required", b.Name)
+		if len(b.NexusAddresses) == 0 {
+			return nil, fmt.Errorf("backend '%s': nexusAddresses is required", b.Name)
 		}
 		if b.AuthToken == "" {
 			return nil, fmt.Errorf("backend '%s': authToken is required", b.Name)
