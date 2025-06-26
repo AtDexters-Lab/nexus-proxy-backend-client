@@ -21,6 +21,12 @@ const (
 	controlByteControl  = 0x02
 	reconnectDelay      = 5 * time.Second
 	healthCheckInterval = 5 * time.Second
+
+	writeToNexusBufferSize = 1024 * 16 // The server specifies a maximum read size of 32KB + 17 bytes for the header, so 16KB is a safe size.
+	// connection health check parameters
+	writeWait    = 10 * time.Second
+	pingInterval = 1 * time.Second
+	pongWait     = 2 * time.Second
 )
 
 // clientConn represents a single proxied connection to the local service.
@@ -38,6 +44,7 @@ type Client struct {
 	ws         *websocket.Conn
 	wsMu       sync.Mutex
 	localConns sync.Map
+	send       chan []byte
 	ctx        context.Context
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
@@ -47,6 +54,7 @@ type Client struct {
 func New(cfg BackendConfig) *Client {
 	return &Client{
 		config: cfg,
+		send:   make(chan []byte, 256), // Buffered channel to handle outgoing messages
 	}
 }
 
@@ -78,6 +86,9 @@ func (c *Client) Start(ctx context.Context) {
 
 		c.wg.Add(1)
 		go c.readPump()
+
+		c.wg.Add(1)
+		go c.writePump()
 
 		c.wg.Wait() // Wait for pumps to exit, indicating a disconnection.
 		log.Printf("INFO: [%s] Disconnected from Nexus Proxy.", c.config.Name)
@@ -125,6 +136,12 @@ func (c *Client) readPump() {
 	ws := c.ws
 	c.wsMu.Unlock()
 	defer ws.Close()
+
+	ws.SetReadDeadline(time.Now().Add(pongWait))
+	ws.SetPongHandler(func(string) error {
+		ws.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
 
 	for {
 		// Create a channel to receive the message from a goroutine
@@ -275,7 +292,7 @@ func (c *Client) copyLocalToNexus(client *clientConn) {
 		c.sendControlMessage("disconnect", client.id)
 	}()
 
-	buf := make([]byte, 16384) // 16KB buffer for reading data - The server specifies a maximum read size of 32KB + 17 bytes for the header, so 16KB is a safe size.
+	buf := make([]byte, writeToNexusBufferSize)
 	for {
 		select {
 		case <-client.quit:
@@ -295,13 +312,47 @@ func (c *Client) copyLocalToNexus(client *clientConn) {
 			copy(header[1:], client.id[:])
 			message := append(header, buf[:n]...)
 
-			c.wsMu.Lock()
-			err = c.ws.WriteMessage(websocket.BinaryMessage, message)
-			c.wsMu.Unlock()
-			if err != nil {
-				log.Printf("ERROR: [%s] Failed to write to Nexus WebSocket: %v", c.config.Name, err)
+			c.send <- message
+		}
+	}
+}
+
+func (c *Client) writePump() {
+	defer c.wg.Done()
+	c.wsMu.Lock()
+	ws := c.ws
+	c.wsMu.Unlock()
+
+	ticker := time.NewTicker(pingInterval)
+	defer func() {
+		ws.Close()
+		ticker.Stop()
+		log.Printf("DEBUG: [%s] Write pump stopped.", c.config.Name)
+	}()
+
+	for {
+		select {
+		case message, ok := <-c.send:
+			if !ok {
+				// The send channel was closed.
+				ws.SetWriteDeadline(time.Now().Add(writeWait))
+				ws.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
+			ws.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := ws.WriteMessage(websocket.BinaryMessage, message); err != nil {
+				log.Printf("ERROR: [%s] Failed to write binary message to Nexus: %v", c.config.Name, err)
+				return // Terminate the pump and session.
+			}
+		case <-ticker.C:
+			// Send a WebSocket-level ping to keep the connection alive.
+			if err := ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
+				log.Printf("ERROR: [%s] Failed to write ping to Nexus: %v", c.config.Name, err)
+				return // Terminate the pump and session.
+			}
+		case <-c.ctx.Done():
+			// The session context was canceled.
+			return
 		}
 	}
 }
@@ -372,6 +423,7 @@ func (c *Client) sendControlMessage(event string, clientID uuid.UUID) {
 		return
 	}
 
+	c.ws.SetWriteDeadline(time.Now().Add(writeWait))
 	if err := c.ws.WriteMessage(websocket.BinaryMessage, message); err != nil {
 		log.Printf("WARN: [%s] Failed to send control message '%s' for ClientID %s: %v", c.config.Name, event, clientID, err)
 	}
