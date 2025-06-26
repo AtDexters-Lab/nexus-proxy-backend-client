@@ -25,8 +25,8 @@ const (
 	writeToNexusBufferSize = 1024 * 16 // The server specifies a maximum read size of 32KB + 17 bytes for the header, so 16KB is a safe size.
 	// connection health check parameters
 	writeWait    = 10 * time.Second
-	pingInterval = 1 * time.Second
-	pongWait     = 2 * time.Second
+	pingInterval = 5 * time.Second
+	pongWait     = 10 * time.Second
 )
 
 // clientConn represents a single proxied connection to the local service.
@@ -317,6 +317,21 @@ func (c *Client) copyLocalToNexus(client *clientConn) {
 	}
 }
 
+func (c *Client) sendControlMessage(event string, clientID uuid.UUID) {
+	var msg struct {
+		Event    string    `json:"event"`
+		ClientID uuid.UUID `json:"client_id"`
+	}
+	msg.Event = event
+	msg.ClientID = clientID
+
+	payload, _ := json.Marshal(msg)
+	header := []byte{controlByteControl}
+	message := append(header, payload...)
+
+	c.send <- message
+}
+
 func (c *Client) writePump() {
 	defer c.wg.Done()
 	c.wsMu.Lock()
@@ -402,29 +417,5 @@ func (c *Client) healthCheckPump() {
 		case <-c.ctx.Done():
 			return
 		}
-	}
-}
-
-func (c *Client) sendControlMessage(event string, clientID uuid.UUID) {
-	var msg struct {
-		Event    string    `json:"event"`
-		ClientID uuid.UUID `json:"client_id"`
-	}
-	msg.Event = event
-	msg.ClientID = clientID
-
-	payload, _ := json.Marshal(msg)
-	header := []byte{controlByteControl}
-	message := append(header, payload...)
-
-	c.wsMu.Lock()
-	defer c.wsMu.Unlock()
-	if c.ws == nil {
-		return
-	}
-
-	c.ws.SetWriteDeadline(time.Now().Add(writeWait))
-	if err := c.ws.WriteMessage(websocket.BinaryMessage, message); err != nil {
-		log.Printf("WARN: [%s] Failed to send control message '%s' for ClientID %s: %v", c.config.Name, event, clientID, err)
 	}
 }
