@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -51,22 +52,34 @@ type ClientBackendConfig struct {
 
 // Client manages the full lifecycle for one configured backend service.
 type Client struct {
-	config     ClientBackendConfig
-	ws         *websocket.Conn
-	wsMu       sync.Mutex
-	localConns sync.Map
-	send       chan []byte
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	config         ClientBackendConfig
+	ws             *websocket.Conn
+	wsMu           sync.Mutex
+	localConns     sync.Map
+	send           chan []byte
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	connectHandler ConnectHandler
 }
 
 // New creates a new Client instance for a specific backend configuration.
-func New(cfg ClientBackendConfig) *Client {
-	return &Client{
+func New(cfg ClientBackendConfig, opts ...Option) *Client {
+	c := &Client{
 		config: cfg,
 		send:   make(chan []byte, 256), // Buffered channel to handle outgoing messages
 	}
+
+	c.connectHandler = c.configBasedConnectHandler()
+
+	for _, opt := range opts {
+		opt(c)
+	}
+	if c.connectHandler == nil {
+		c.connectHandler = c.configBasedConnectHandler()
+	}
+
+	return c
 }
 
 // Start initiates the client's connection loop.
@@ -225,21 +238,28 @@ func (c *Client) handleControlMessage(payload []byte) {
 
 	switch msg.Event {
 	case "connect":
-		localAddr, ok := c.resolveLocalAddress(msg.ConnPort, msg.Hostname)
-		if !ok {
-			log.Printf("ERROR: [%s] Received connect for hostname '%s' on unmapped destination port %d. Ignoring.", c.config.Name, msg.Hostname, msg.ConnPort)
-			return
-		}
-
 		normalizedHost := normalizeHostname(msg.Hostname)
 		if normalizedHost == "" {
 			normalizedHost = msg.Hostname
 		}
-		log.Printf("INFO: [%s] Received 'connect' for ClientID %s on port %d (hostname: %s). Dialing local service at %s", c.config.Name, msg.ClientID, msg.ConnPort, normalizedHost, localAddr)
+		log.Printf("INFO: [%s] Received 'connect' for ClientID %s on port %d (hostname: %s).", c.config.Name, msg.ClientID, msg.ConnPort, normalizedHost)
 
-		conn, err := net.Dial("tcp", localAddr)
+		req := ConnectRequest{
+			BackendName:      c.config.Name,
+			ClientID:         msg.ClientID,
+			Hostname:         normalizedHost,
+			OriginalHostname: msg.Hostname,
+			Port:             msg.ConnPort,
+			ClientIP:         msg.ClientIP,
+		}
+
+		conn, err := c.openBackendConnection(req)
 		if err != nil {
-			log.Printf("ERROR: [%s] Failed to connect to local service at %s: %v", c.config.Name, localAddr, err)
+			if errors.Is(err, ErrNoRoute) {
+				log.Printf("ERROR: [%s] No route configured for hostname '%s' on port %d", c.config.Name, msg.Hostname, msg.ConnPort)
+			} else {
+				log.Printf("ERROR: [%s] Failed to establish local connection for client %s: %v", c.config.Name, msg.ClientID, err)
+			}
 			return
 		}
 
@@ -284,6 +304,38 @@ func (c *Client) resolveLocalAddress(port int, hostname string) (string, bool) {
 		return "", false
 	}
 	return mapping.Resolve(hostname)
+}
+
+func (c *Client) openBackendConnection(req ConnectRequest) (net.Conn, error) {
+	handler := c.connectHandler
+	if handler == nil {
+		return nil, fmt.Errorf("connect handler not configured")
+	}
+
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	conn, err := handler(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if conn == nil {
+		return nil, fmt.Errorf("connect handler returned nil connection without error")
+	}
+	return conn, nil
+}
+
+func (c *Client) configBasedConnectHandler() ConnectHandler {
+	return func(ctx context.Context, req ConnectRequest) (net.Conn, error) {
+		localAddr, ok := c.resolveLocalAddress(req.Port, req.Hostname)
+		if !ok {
+			return nil, ErrNoRoute
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", localAddr)
+	}
 }
 
 func (c *Client) handleDataMessage(payload []byte) {

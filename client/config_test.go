@@ -1,6 +1,10 @@
 package client
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestPortMappingResolveDefault(t *testing.T) {
 	pm := PortMapping{Default: "localhost:8080"}
@@ -82,5 +86,30 @@ func TestPortMappingResolveWildcard(t *testing.T) {
 	}
 	if _, ok := pmNoDefault.Resolve("unmatched.test"); ok {
 		t.Fatal("expected resolution to fail without default")
+	}
+}
+
+func TestLoadConfigRejectsUnknownPortMappingField(t *testing.T) {
+	configYAML := `backends:
+  - name: "dynamic"
+    hostnames:
+      - "example.com"
+    nexusAddresses:
+      - "wss://nexus.example.com/connect"
+    authToken: "token"
+    portMappings:
+      80:
+        default: "localhost:8080"
+        hostnames:
+          "example.com": "localhost:9090"
+`
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(configYAML), 0o600); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("expected error due to unknown 'hostnames' field in port mapping")
 	}
 }
