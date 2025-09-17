@@ -11,12 +11,28 @@ It demonstrates how a local service can securely connect to the Nexus mesh and h
 3.  **Presents Token:** It sends a complete, pre-signed JSON Web Token (JWT) provided in the config. The client itself has no access to the JWT secret.
 4.  **Listens for Commands:** It listens for simple JSON control messages from the proxy, primarily `connect` and `disconnect` commands.
 5.  **Active Health Checks:** The client actively monitors its connections. If a connection is idle for too long, it sends a `ping_client` message to the Nexus Proxy to verify the connection is still alive on the proxy side. If no `pong_client` is received, the client cleans up the local connection, preventing zombies.
-6.  **Multi-Port Relaying:** Based on port mappings in the config, it relays traffic between the Nexus proxy and the appropriate local service.
+6.  **Host-Aware Relaying:** `portMappings` can now route by port, hostname, or single-label wildcard (e.g. `*.preview.example.com`), allowing one backend connection to front multiple virtual hosts.
 
 ## Configuration
 
 The client is configured via a `config.yaml` file.
-See (example)[config.example.yaml]
+See [config.example.yaml](config.example.yaml).
+
+Key fields:
+
+- `hostnames`: list every FQDN (or `*.example.com` wildcard) this backend will serve. These must line up with the JWT claims you provision.
+- `portMappings`: maps the public Nexus port to a local target using a structured form that supports hostname-specific overrides:
+
+    ```yaml
+    portMappings:
+      443:
+        default: "localhost:8443"
+        hosts:
+          api.example.com: "localhost:9443"
+          "*.preview.example.com": "localhost:10443"
+    ```
+
+  Exact hostnames take precedence over wildcards, and wildcards only match a single label (e.g. `a.preview.example.com`).
 
 ### Example Usage
 
