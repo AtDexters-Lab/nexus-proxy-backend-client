@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +34,7 @@ const (
 type clientConn struct {
 	id           uuid.UUID
 	conn         net.Conn
+	hostname     string
 	lastActivity atomic.Int64 // Unix timestamp of the last activity.
 	pingSent     atomic.Bool  // True if an inactivity ping has been sent.
 	quit         chan struct{}
@@ -40,10 +42,10 @@ type clientConn struct {
 
 type ClientBackendConfig struct {
 	Name         string
-	Hostname     string
+	Hostnames    []string
 	NexusAddress string
 	AuthToken    string
-	PortMappings map[int]string
+	PortMappings map[int]PortMapping
 	HealthChecks HealthCheckConfig
 }
 
@@ -72,7 +74,7 @@ func (c *Client) Start(ctx context.Context) {
 	c.ctx, c.cancel = context.WithCancel(ctx)
 	defer c.cleanup()
 
-	log.Printf("INFO: [%s] Manager started for hostname: %s", c.config.Name, c.config.Hostname)
+	log.Printf("INFO: [%s] Manager started for hostnames: %s", c.config.Name, strings.Join(c.config.Hostnames, ", "))
 
 	// Start the health check pump to monitor connection health.
 	go c.healthCheckPump()
@@ -214,6 +216,7 @@ func (c *Client) handleControlMessage(payload []byte) {
 		ClientID uuid.UUID `json:"client_id"`
 		ConnPort int       `json:"conn_port"` // Port on which the client is connecting
 		ClientIP string    `json:"client_ip"` // Optional field for future use
+		Hostname string    `json:"hostname"`
 	}
 	if err := json.Unmarshal(payload, &msg); err != nil {
 		log.Printf("WARN: [%s] Failed to unmarshal control message: %v", c.config.Name, err)
@@ -222,13 +225,17 @@ func (c *Client) handleControlMessage(payload []byte) {
 
 	switch msg.Event {
 	case "connect":
-		localAddr, ok := c.config.PortMappings[msg.ConnPort]
+		localAddr, ok := c.resolveLocalAddress(msg.ConnPort, msg.Hostname)
 		if !ok {
-			log.Printf("ERROR: [%s] Received connect for unmapped destination port %d. Ignoring.", c.config.Name, msg.ConnPort)
+			log.Printf("ERROR: [%s] Received connect for hostname '%s' on unmapped destination port %d. Ignoring.", c.config.Name, msg.Hostname, msg.ConnPort)
 			return
 		}
 
-		log.Printf("INFO: [%s] Received 'connect' for ClientID %s on port %d. Dialing local service at %s", c.config.Name, msg.ClientID, msg.ConnPort, localAddr)
+		normalizedHost := normalizeHostname(msg.Hostname)
+		if normalizedHost == "" {
+			normalizedHost = msg.Hostname
+		}
+		log.Printf("INFO: [%s] Received 'connect' for ClientID %s on port %d (hostname: %s). Dialing local service at %s", c.config.Name, msg.ClientID, msg.ConnPort, normalizedHost, localAddr)
 
 		conn, err := net.Dial("tcp", localAddr)
 		if err != nil {
@@ -237,9 +244,10 @@ func (c *Client) handleControlMessage(payload []byte) {
 		}
 
 		newClient := &clientConn{
-			id:   msg.ClientID,
-			conn: conn,
-			quit: make(chan struct{}),
+			id:       msg.ClientID,
+			conn:     conn,
+			hostname: normalizedHost,
+			quit:     make(chan struct{}),
 		}
 		newClient.lastActivity.Store(time.Now().Unix())
 		c.localConns.Store(msg.ClientID, newClient)
@@ -250,6 +258,9 @@ func (c *Client) handleControlMessage(payload []byte) {
 		log.Printf("INFO: [%s] Received 'disconnect' for ClientID: %s. Closing local connection.", c.config.Name, msg.ClientID)
 		if val, ok := c.localConns.Load(msg.ClientID); ok {
 			if conn, ok := val.(*clientConn); ok {
+				if conn.hostname != "" {
+					log.Printf("DEBUG: [%s] Disconnecting client %s for hostname %s", c.config.Name, msg.ClientID, conn.hostname)
+				}
 				close(conn.quit)
 				conn.conn.Close()
 				c.localConns.Delete(msg.ClientID)
@@ -265,6 +276,14 @@ func (c *Client) handleControlMessage(payload []byte) {
 			}
 		}
 	}
+}
+
+func (c *Client) resolveLocalAddress(port int, hostname string) (string, bool) {
+	mapping, ok := c.config.PortMappings[port]
+	if !ok {
+		return "", false
+	}
+	return mapping.Resolve(hostname)
 }
 
 func (c *Client) handleDataMessage(payload []byte) {
@@ -283,7 +302,11 @@ func (c *Client) handleDataMessage(payload []byte) {
 			_, err := conn.conn.Write(data)
 			if err != nil {
 				conn.conn.Close()
-				log.Printf("ERROR: [%s] Failed to write data to local connection for ClientID %s: %v", c.config.Name, clientID, err)
+				if conn.hostname != "" {
+					log.Printf("ERROR: [%s] Failed to write data to local connection for ClientID %s (%s): %v", c.config.Name, clientID, conn.hostname, err)
+				} else {
+					log.Printf("ERROR: [%s] Failed to write data to local connection for ClientID %s: %v", c.config.Name, clientID, err)
+				}
 			}
 		}
 	} else {
@@ -296,7 +319,11 @@ func (c *Client) copyLocalToNexus(client *clientConn) {
 	defer func() {
 		client.conn.Close()
 		c.localConns.Delete(client.id)
-		log.Printf("INFO: [%s] Cleaned up local connection for ClientID %s", c.config.Name, client.id)
+		if client.hostname != "" {
+			log.Printf("INFO: [%s] Cleaned up local connection for ClientID %s (%s)", c.config.Name, client.id, client.hostname)
+		} else {
+			log.Printf("INFO: [%s] Cleaned up local connection for ClientID %s", c.config.Name, client.id)
+		}
 
 		c.sendControlMessage("disconnect", client.id)
 	}()
@@ -310,7 +337,11 @@ func (c *Client) copyLocalToNexus(client *clientConn) {
 			n, err := client.conn.Read(buf)
 			if err != nil {
 				if err != io.EOF {
-					log.Printf("WARN: [%s] Error reading from local connection for ClientID %s: %v", c.config.Name, client.id, err)
+					if client.hostname != "" {
+						log.Printf("WARN: [%s] Error reading from local connection for ClientID %s (%s): %v", c.config.Name, client.id, client.hostname, err)
+					} else {
+						log.Printf("WARN: [%s] Error reading from local connection for ClientID %s: %v", c.config.Name, client.id, err)
+					}
 				}
 				return
 			}
@@ -408,7 +439,11 @@ func (c *Client) healthCheckPump() {
 				}
 
 				if time.Since(time.Unix(conn.lastActivity.Load(), 0)) > inactivityTimeout {
-					log.Printf("DEBUG: [%s] Client %s is idle, sending ping.", c.config.Name, conn.id)
+					if conn.hostname != "" {
+						log.Printf("DEBUG: [%s] Client %s (%s) is idle, sending ping.", c.config.Name, conn.id, conn.hostname)
+					} else {
+						log.Printf("DEBUG: [%s] Client %s is idle, sending ping.", c.config.Name, conn.id)
+					}
 					conn.pingSent.Store(true)
 					c.sendControlMessage("ping_client", conn.id)
 
@@ -416,7 +451,11 @@ func (c *Client) healthCheckPump() {
 					time.AfterFunc(pongTimeout, func() {
 						if conn.pingSent.Load() {
 							// Pong was not received in time.
-							log.Printf("WARN: [%s] Did not receive pong for idle client %s within %s. Closing connection.", c.config.Name, conn.id, pongTimeout)
+							if conn.hostname != "" {
+								log.Printf("WARN: [%s] Did not receive pong for idle client %s (%s) within %s. Closing connection.", c.config.Name, conn.id, conn.hostname, pongTimeout)
+							} else {
+								log.Printf("WARN: [%s] Did not receive pong for idle client %s within %s. Closing connection.", c.config.Name, conn.id, pongTimeout)
+							}
 							conn.conn.Close() // This will trigger the full cleanup process.
 						}
 					})

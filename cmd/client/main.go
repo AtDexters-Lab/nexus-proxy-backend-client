@@ -36,7 +36,7 @@ func main() {
 				c.Start(ctx)
 			}(client.ClientBackendConfig{
 				Name:         backendCfg.Name,
-				Hostname:     backendCfg.Hostname,
+				Hostnames:    append([]string(nil), backendCfg.Hostnames...),
 				NexusAddress: nexusAddr,
 				AuthToken:    backendCfg.AuthToken,
 				PortMappings: backendCfg.PortMappings,
