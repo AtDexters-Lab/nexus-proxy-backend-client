@@ -32,7 +32,7 @@ Key fields:
           "*.preview.example.com": "localhost:10443"
     ```
 
-  Exact hostnames take precedence over wildcards, and wildcards only match a single label (e.g. `a.preview.example.com`).
+ Exact hostnames take precedence over wildcards, and wildcards only match a single label (e.g. `a.preview.example.com`).
 
 ### Example Usage
 
@@ -41,3 +41,28 @@ Key fields:
     ```bash
     go run ./cmd/client -config config.yaml
     ```
+
+## Library Mode
+
+Embedding the client inside another Go service is as simple as constructing a
+`client.ClientBackendConfig` and passing optional behaviour overrides. The most
+useful hook is `client.WithConnectHandler`, which lets you choose the local
+destination for each inbound request (or even serve it with an in-memory
+`net.Conn`). Returning `client.ErrNoRoute` falls back to the static
+`portMappings` declared in the config.
+
+```go
+router := func(ctx context.Context, req client.ConnectRequest) (net.Conn, error) {
+    if strings.HasSuffix(req.Hostname, ".pclo.example.com") {
+        return net.Dial("tcp", "localhost:5080")
+    }
+    // Defer to the default YAML-configured mapping.
+    return nil, client.ErrNoRoute
+}
+
+c := client.New(cfg, client.WithConnectHandler(router))
+go c.Start(ctx)
+```
+
+This makes it straightforward to implement per-tenant routing rules, connect to
+ephemeral processes, or hand back a `net.Pipe()` for fully in-memory handlers.
