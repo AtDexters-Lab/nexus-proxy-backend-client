@@ -61,6 +61,8 @@ type Client struct {
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
 	connectHandler ConnectHandler
+	tokenProvider  TokenProvider
+	staticToken    TokenProvider
 }
 
 // New creates a new Client instance for a specific backend configuration.
@@ -71,12 +73,27 @@ func New(cfg ClientBackendConfig, opts ...Option) *Client {
 	}
 
 	c.connectHandler = c.configBasedConnectHandler()
+	defaultTokenProvider := func(ctx context.Context) (Token, error) {
+		token := strings.TrimSpace(cfg.AuthToken)
+		if token == "" {
+			return Token{}, fmt.Errorf("client: static auth token is empty")
+		}
+		return Token{Value: token}, nil
+	}
+	c.staticToken = defaultTokenProvider
+	c.tokenProvider = defaultTokenProvider
 
 	for _, opt := range opts {
 		opt(c)
 	}
 	if c.connectHandler == nil {
 		c.connectHandler = c.configBasedConnectHandler()
+	}
+	if c.tokenProvider == nil {
+		c.tokenProvider = defaultTokenProvider
+	}
+	if c.staticToken == nil {
+		c.staticToken = defaultTokenProvider
 	}
 
 	return c
@@ -127,17 +144,46 @@ func (c *Client) Stop() {
 	}
 }
 
+func (c *Client) getAuthToken(ctx context.Context) (string, error) {
+	provider := c.tokenProvider
+	if provider == nil {
+		return "", fmt.Errorf("token provider not configured")
+	}
+
+	token, err := provider(ctx)
+	if err != nil {
+		return "", fmt.Errorf("token provider failed: %w", err)
+	}
+
+	value := strings.TrimSpace(token.Value)
+	if value == "" {
+		return "", fmt.Errorf("token provider returned empty token")
+	}
+
+	return value, nil
+}
+
 func (c *Client) connectAndAuthenticate() error {
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	token, err := c.getAuthToken(ctx)
+	if err != nil {
+		return err
+	}
+
 	c.wsMu.Lock()
 	defer c.wsMu.Unlock()
 
-	ws, _, err := websocket.DefaultDialer.DialContext(c.ctx, c.config.NexusAddress, nil)
+	ws, _, err := websocket.DefaultDialer.DialContext(ctx, c.config.NexusAddress, nil)
 	if err != nil {
 		return fmt.Errorf("dial failed: %w", err)
 	}
 	c.ws = ws
 
-	if err := c.ws.WriteMessage(websocket.TextMessage, []byte(c.config.AuthToken)); err != nil {
+	if err := c.ws.WriteMessage(websocket.TextMessage, []byte(token)); err != nil {
 		c.ws.Close()
 		return fmt.Errorf("auth failed: %w", err)
 	}

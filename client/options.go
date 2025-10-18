@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -27,6 +28,18 @@ type ConnectRequest struct {
 // local connection. Returning ErrNoRoute will defer to the default
 // port-mapping behaviour. Any other error is treated as fatal for that request.
 type ConnectHandler func(ctx context.Context, req ConnectRequest) (net.Conn, error)
+
+// Token encapsulates the authentication token value and optional expiry.
+// An Expiry value of the zero time indicates that the provider does not have
+// expiry information available.
+type Token struct {
+	Value  string
+	Expiry time.Time
+}
+
+// TokenProvider retrieves the auth token that the client should present when
+// connecting to the Nexus proxy.
+type TokenProvider func(ctx context.Context) (Token, error)
 
 // Option mutates a Client during construction.
 type Option func(*Client)
@@ -53,5 +66,18 @@ func WithConnectHandler(handler ConnectHandler) Option {
 				return conn, nil
 			}
 		}
+	}
+}
+
+// WithTokenProvider installs a callback that will be invoked to fetch an auth
+// token before each connection attempt. Passing nil resets the client to use
+// the static token from the configuration.
+func WithTokenProvider(provider TokenProvider) Option {
+	return func(c *Client) {
+		if provider == nil {
+			c.tokenProvider = c.staticToken
+			return
+		}
+		c.tokenProvider = provider
 	}
 }
