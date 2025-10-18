@@ -96,3 +96,109 @@ func TestClientWithCustomConnectHandler(t *testing.T) {
 
 	t.Fatalf("expected client connection cleanup after handler close")
 }
+
+func TestClientGetAuthToken_DefaultProvider(t *testing.T) {
+	cfg := ClientBackendConfig{
+		Name:         "default-token",
+		Hostnames:    []string{"example.com"},
+		NexusAddress: "wss://nexus.example.com/connect",
+		AuthToken:    "  static-token  ",
+		PortMappings: map[int]PortMapping{
+			80: {Default: "localhost:8080"},
+		},
+	}
+
+	c := New(cfg)
+
+	token, err := c.getAuthToken(context.Background())
+	if err != nil {
+		t.Fatalf("expected token, got error: %v", err)
+	}
+	if token != "static-token" {
+		t.Fatalf("expected trimmed token value, got %q", token)
+	}
+}
+
+func TestClientGetAuthToken_WithTokenProvider(t *testing.T) {
+	cfg := ClientBackendConfig{
+		Name:         "dynamic-token",
+		Hostnames:    []string{"example.com"},
+		NexusAddress: "wss://nexus.example.com/connect",
+		AuthToken:    "unused",
+		PortMappings: map[int]PortMapping{
+			80: {Default: "localhost:8080"},
+		},
+	}
+
+	var callCount int
+	provider := func(ctx context.Context) (Token, error) {
+		callCount++
+		return Token{Value: "dynamic-token-value"}, nil
+	}
+
+	c := New(cfg, WithTokenProvider(provider))
+
+	token, err := c.getAuthToken(context.Background())
+	if err != nil {
+		t.Fatalf("expected token from provider, got error: %v", err)
+	}
+	if token != "dynamic-token-value" {
+		t.Fatalf("expected token from provider, got %q", token)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected provider to be invoked once, got %d calls", callCount)
+	}
+}
+
+func TestWithTokenProviderNilResetsToStatic(t *testing.T) {
+	cfg := ClientBackendConfig{
+		Name:         "reset-token",
+		Hostnames:    []string{"example.com"},
+		NexusAddress: "wss://nexus.example.com/connect",
+		AuthToken:    "static-token",
+		PortMappings: map[int]PortMapping{
+			80: {Default: "localhost:8080"},
+		},
+	}
+
+	c := New(cfg)
+
+	initial, err := c.getAuthToken(context.Background())
+	if err != nil {
+		t.Fatalf("expected initial static token, got error: %v", err)
+	}
+	if initial != "static-token" {
+		t.Fatalf("expected initial static token, got %q", initial)
+	}
+
+	var dynamicCalls int
+	dynamicProvider := func(ctx context.Context) (Token, error) {
+		dynamicCalls++
+		return Token{Value: "dynamic"}, nil
+	}
+
+	WithTokenProvider(dynamicProvider)(c)
+	dynamic, err := c.getAuthToken(context.Background())
+	if err != nil {
+		t.Fatalf("expected dynamic token, got error: %v", err)
+	}
+	if dynamic != "dynamic" {
+		t.Fatalf("expected dynamic token, got %q", dynamic)
+	}
+	if dynamicCalls != 1 {
+		t.Fatalf("expected dynamic provider to be called once, got %d", dynamicCalls)
+	}
+
+	dynamicCalls = 0
+	WithTokenProvider(nil)(c)
+	reset, err := c.getAuthToken(context.Background())
+	if err != nil {
+		t.Fatalf("expected reset static token, got error: %v", err)
+	}
+	if reset != "static-token" {
+		t.Fatalf("expected reset static token, got %q", reset)
+	}
+	if dynamicCalls != 0 {
+		t.Fatalf("expected dynamic provider not to be called after reset, got %d calls", dynamicCalls)
+	}
+}
