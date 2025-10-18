@@ -48,8 +48,11 @@ Embedding the client inside another Go service is as simple as constructing a
 `client.ClientBackendConfig` and passing optional behaviour overrides. The most
 useful hook is `client.WithConnectHandler`, which lets you choose the local
 destination for each inbound request (or even serve it with an in-memory
-`net.Conn`). Returning `client.ErrNoRoute` falls back to the static
-`portMappings` declared in the config.
+`net.Conn`). `ConnectRequest` now includes an `IsTLS` flag that mirrors the
+proxy's TLS detection, so your handler can apply different routing or wrap the
+dial in TLS when the original client negotiated HTTPS. Returning
+`client.ErrNoRoute` falls back to the static `portMappings` declared in the
+config.
 
 ```go
 router := func(ctx context.Context, req client.ConnectRequest) (net.Conn, error) {

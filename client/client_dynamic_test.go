@@ -45,12 +45,14 @@ func TestClientWithCustomConnectHandler(t *testing.T) {
 		ConnPort int       `json:"conn_port"`
 		ClientIP string    `json:"client_ip"`
 		Hostname string    `json:"hostname"`
+		IsTLS    bool      `json:"is_tls"`
 	}{
 		Event:    "connect",
 		ClientID: uuid.New(),
 		ConnPort: 80,
 		ClientIP: "203.0.113.10",
 		Hostname: "Hello.EXAMPLE.com",
+		IsTLS:    true,
 	}
 
 	payload, err := json.Marshal(msg)
@@ -77,6 +79,9 @@ func TestClientWithCustomConnectHandler(t *testing.T) {
 	}
 	if gotReq.ClientIP != msg.ClientIP {
 		t.Fatalf("expected client IP %s, got %s", msg.ClientIP, gotReq.ClientIP)
+	}
+	if !gotReq.IsTLS {
+		t.Fatalf("expected IsTLS to be true")
 	}
 
 	if _, ok := c.localConns.Load(msg.ClientID); !ok {

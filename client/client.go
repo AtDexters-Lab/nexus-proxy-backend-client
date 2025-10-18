@@ -276,6 +276,7 @@ func (c *Client) handleControlMessage(payload []byte) {
 		ConnPort int       `json:"conn_port"` // Port on which the client is connecting
 		ClientIP string    `json:"client_ip"` // Optional field for future use
 		Hostname string    `json:"hostname"`
+		IsTLS    bool      `json:"is_tls"` // Indicates whether the original client spoke TLS.
 	}
 	if err := json.Unmarshal(payload, &msg); err != nil {
 		log.Printf("WARN: [%s] Failed to unmarshal control message: %v", c.config.Name, err)
@@ -288,7 +289,7 @@ func (c *Client) handleControlMessage(payload []byte) {
 		if normalizedHost == "" {
 			normalizedHost = msg.Hostname
 		}
-		log.Printf("INFO: [%s] Received 'connect' for ClientID %s on port %d (hostname: %s).", c.config.Name, msg.ClientID, msg.ConnPort, normalizedHost)
+		log.Printf("INFO: [%s] Received 'connect' for ClientID %s on port %d (hostname: %s, tls:%v).", c.config.Name, msg.ClientID, msg.ConnPort, normalizedHost, msg.IsTLS)
 
 		req := ConnectRequest{
 			BackendName:      c.config.Name,
@@ -297,6 +298,7 @@ func (c *Client) handleControlMessage(payload []byte) {
 			OriginalHostname: msg.Hostname,
 			Port:             msg.ConnPort,
 			ClientIP:         msg.ClientIP,
+			IsTLS:            msg.IsTLS,
 		}
 
 		conn, err := c.openBackendConnection(req)

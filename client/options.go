@@ -22,6 +22,7 @@ type ConnectRequest struct {
 	OriginalHostname string
 	Port             int
 	ClientIP         string
+	IsTLS            bool
 }
 
 // ConnectHandler is invoked whenever the proxy asks us to establish a new
