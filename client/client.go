@@ -17,6 +17,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+var jsonMarshal = json.Marshal
+
 const (
 	clientIDLength      = 16
 	controlByteData     = 0x01
@@ -30,6 +32,8 @@ const (
 	pingInterval = 5 * time.Second
 	pongWait     = 10 * time.Second
 )
+
+var errSessionInactive = errors.New("client session inactive")
 
 // clientConn represents a single proxied connection to the local service.
 type clientConn struct {
@@ -57,6 +61,8 @@ type Client struct {
 	wsMu           sync.Mutex
 	localConns     sync.Map
 	send           chan []byte
+	connected      atomic.Bool
+	sessionDone    atomic.Value // stores chan struct{}
 	ctx            context.Context
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
@@ -71,6 +77,7 @@ func New(cfg ClientBackendConfig, opts ...Option) *Client {
 		config: cfg,
 		send:   make(chan []byte, 256), // Buffered channel to handle outgoing messages
 	}
+	c.sessionDone.Store((chan struct{})(nil))
 
 	c.connectHandler = c.configBasedConnectHandler()
 	defaultTokenProvider := func(ctx context.Context) (Token, error) {
@@ -125,13 +132,16 @@ func (c *Client) Start(ctx context.Context) {
 
 		log.Printf("INFO: [%s] Connection established and authenticated. Starting pumps.", c.config.Name)
 
+		sessionCh := c.beginSession()
+
 		c.wg.Add(1)
 		go c.readPump()
 
 		c.wg.Add(1)
-		go c.writePump()
+		go c.writePump(sessionCh)
 
 		c.wg.Wait() // Wait for pumps to exit, indicating a disconnection.
+		c.clearSendQueue()
 		log.Printf("INFO: [%s] Disconnected from Nexus Proxy.", c.config.Name)
 	}
 }
@@ -213,27 +223,30 @@ func (c *Client) readPump() {
 		return nil
 	})
 
+	type readResult struct {
+		msg []byte
+		err error
+	}
+
 	for {
-		// Create a channel to receive the message from a goroutine
-		msgChan := make(chan []byte)
-		errChan := make(chan error)
+		resultCh := make(chan readResult, 1)
 
 		go func() {
 			if ws == nil {
-				errChan <- fmt.Errorf("connection is nil")
+				resultCh <- readResult{err: fmt.Errorf("connection is nil")}
 				return
 			}
 			msgType, msg, err := ws.ReadMessage()
 			if err != nil {
-				errChan <- err
+				resultCh <- readResult{err: err}
 				return
 			}
 			if msgType != websocket.BinaryMessage || len(msg) < 1 {
-				errChan <- fmt.Errorf("[%s] Received non-binary message or too short payload: %d bytes", c.config.Name, len(msg))
+				resultCh <- readResult{err: fmt.Errorf("received non-binary message or too short payload: %d bytes", len(msg))}
 				return
 			}
 
-			msgChan <- msg
+			resultCh <- readResult{msg: msg}
 		}()
 
 		select {
@@ -242,20 +255,21 @@ func (c *Client) readPump() {
 			log.Println("readLoop: context done, closing connection.")
 			return // Exit the loop
 
-		case err := <-errChan:
+		case res := <-resultCh:
 			// An error occurred during ReadMessage.
-			select {
-			case <-c.ctx.Done():
-				return
-			default:
-				log.Printf("ERROR: [%s] Error reading from Nexus: %v", c.config.Name, err)
+			if res.err != nil {
+				select {
+				case <-c.ctx.Done():
+					return
+				default:
+					log.Printf("ERROR: [%s] Error reading from Nexus: %v", c.config.Name, res.err)
+				}
+				return // Exit the loop
 			}
-			return // Exit the loop
 
-		case msg := <-msgChan:
 			// We received a message. Process it.
-			controlByte := msg[0]
-			payload := msg[1:]
+			controlByte := res.msg[0]
+			payload := res.msg[1:]
 
 			switch controlByte {
 			case controlByteControl:
@@ -411,7 +425,9 @@ func (c *Client) handleDataMessage(payload []byte) {
 		}
 	} else {
 		log.Printf("WARN: [%s] No local connection found for ClientID %s. Data will be dropped. Disconnect will be sent to proxy", c.config.Name, clientID)
-		c.sendControlMessage("disconnect", clientID)
+		if err := c.sendControlMessage("disconnect", clientID); err != nil {
+			log.Printf("DEBUG: [%s] Failed to enqueue disconnect for ClientID %s: %v", c.config.Name, clientID, err)
+		}
 	}
 }
 
@@ -425,7 +441,9 @@ func (c *Client) copyLocalToNexus(client *clientConn) {
 			log.Printf("INFO: [%s] Cleaned up local connection for ClientID %s", c.config.Name, client.id)
 		}
 
-		c.sendControlMessage("disconnect", client.id)
+		if err := c.sendControlMessage("disconnect", client.id); err != nil {
+			log.Printf("DEBUG: [%s] Failed to enqueue disconnect for ClientID %s: %v", c.config.Name, client.id, err)
+		}
 	}()
 
 	buf := make([]byte, writeToNexusBufferSize)
@@ -452,12 +470,78 @@ func (c *Client) copyLocalToNexus(client *clientConn) {
 			copy(header[1:], client.id[:])
 			message := append(header, buf[:n]...)
 
-			c.send <- message
+			if err := c.enqueue(message); err != nil {
+				if !errors.Is(err, errSessionInactive) && !errors.Is(err, context.Canceled) {
+					log.Printf("WARN: [%s] Failed to enqueue data for ClientID %s: %v", c.config.Name, client.id, err)
+				}
+				return
+			}
 		}
 	}
 }
 
-func (c *Client) sendControlMessage(event string, clientID uuid.UUID) {
+func (c *Client) clearSendQueue() {
+	for {
+		select {
+		case <-c.send:
+		default:
+			return
+		}
+	}
+}
+
+func (c *Client) beginSession() chan struct{} {
+	sessionCh := make(chan struct{})
+	c.sessionDone.Store(sessionCh)
+	c.connected.Store(true)
+	return sessionCh
+}
+
+func (c *Client) enqueue(message []byte) error {
+	if !c.connected.Load() {
+		return errSessionInactive
+	}
+
+	var done <-chan struct{}
+	if v := c.sessionDone.Load(); v != nil {
+		if ch, ok := v.(chan struct{}); ok && ch != nil {
+			done = ch
+		}
+	}
+
+	if c.ctx == nil {
+		if done != nil {
+			select {
+			case c.send <- message:
+				return nil
+			case <-done:
+				return errSessionInactive
+			}
+		}
+		c.send <- message
+		return nil
+	}
+
+	if done != nil {
+		select {
+		case c.send <- message:
+			return nil
+		case <-done:
+			return errSessionInactive
+		case <-c.ctx.Done():
+			return c.ctx.Err()
+		}
+	}
+
+	select {
+	case c.send <- message:
+		return nil
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	}
+}
+
+func (c *Client) sendControlMessage(event string, clientID uuid.UUID) error {
 	var msg struct {
 		Event    string    `json:"event"`
 		ClientID uuid.UUID `json:"client_id"`
@@ -465,22 +549,46 @@ func (c *Client) sendControlMessage(event string, clientID uuid.UUID) {
 	msg.Event = event
 	msg.ClientID = clientID
 
-	payload, _ := json.Marshal(msg)
+	payload, err := jsonMarshal(msg)
+	if err != nil {
+		log.Printf("ERROR: [%s] Failed to marshal control message '%s' for client %s: %v", c.config.Name, event, clientID, err)
+		return err
+	}
 	header := []byte{controlByteControl}
 	message := append(header, payload...)
 
-	c.send <- message
+	if err := c.enqueue(message); err != nil {
+		if errors.Is(err, errSessionInactive) {
+			log.Printf("DEBUG: [%s] Dropping control message '%s' for client %s: session inactive", c.config.Name, event, clientID)
+		} else if errors.Is(err, context.Canceled) {
+			log.Printf("DEBUG: [%s] Dropping control message '%s' for client %s: client context canceled", c.config.Name, event, clientID)
+		} else {
+			log.Printf("WARN: [%s] Failed to enqueue control message '%s' for client %s: %v", c.config.Name, event, clientID, err)
+		}
+		return err
+	}
+	return nil
 }
 
-func (c *Client) writePump() {
+func (c *Client) writePump(sessionCh chan struct{}) {
 	defer c.wg.Done()
 	c.wsMu.Lock()
 	ws := c.ws
 	c.wsMu.Unlock()
 
+	if sessionCh == nil {
+		sessionCh = c.beginSession()
+	}
+
 	ticker := time.NewTicker(pingInterval)
 	defer func() {
-		ws.Close()
+		c.connected.Store(false)
+		close(sessionCh)
+		c.sessionDone.Store((chan struct{})(nil))
+		c.clearSendQueue()
+		if ws != nil {
+			ws.Close()
+		}
 		ticker.Stop()
 		log.Printf("DEBUG: [%s] Write pump stopped.", c.config.Name)
 	}()
@@ -545,7 +653,10 @@ func (c *Client) healthCheckPump() {
 						log.Printf("DEBUG: [%s] Client %s is idle, sending ping.", c.config.Name, conn.id)
 					}
 					conn.pingSent.Store(true)
-					c.sendControlMessage("ping_client", conn.id)
+					if err := c.sendControlMessage("ping_client", conn.id); err != nil {
+						conn.pingSent.Store(false)
+						log.Printf("DEBUG: [%s] Failed to send ping for client %s: %v", c.config.Name, conn.id, err)
+					}
 
 					// Start a timer to check for the pong.
 					time.AfterFunc(pongTimeout, func() {
