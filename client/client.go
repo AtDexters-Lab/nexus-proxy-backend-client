@@ -28,12 +28,24 @@ const (
 
 	writeToNexusBufferSize = 1024 * 16 // The server specifies a maximum read size of 32KB + 17 bytes for the header, so 16KB is a safe size.
 	// connection health check parameters
-	writeWait    = 10 * time.Second
-	pingInterval = 5 * time.Second
-	pongWait     = 10 * time.Second
+	writeWait        = 10 * time.Second
+	pingInterval     = 5 * time.Second
+	pongWait         = 10 * time.Second
+	handshakeTimeout = 15 * time.Second
+	maxMessageSize   = 32*1024 + 17
 )
 
 var errSessionInactive = errors.New("client session inactive")
+
+type outboundMessage struct {
+	messageType int
+	payload     []byte
+}
+
+type challengeMessage struct {
+	Type  string `json:"type"`
+	Nonce string `json:"nonce"`
+}
 
 // clientConn represents a single proxied connection to the local service.
 type clientConn struct {
@@ -49,46 +61,49 @@ type ClientBackendConfig struct {
 	Name         string
 	Hostnames    []string
 	NexusAddress string
-	AuthToken    string
+	Weight       int
+	Attestation  AttestationOptions
 	PortMappings map[int]PortMapping
 	HealthChecks HealthCheckConfig
 }
 
 // Client manages the full lifecycle for one configured backend service.
 type Client struct {
-	config         ClientBackendConfig
-	ws             *websocket.Conn
-	wsMu           sync.Mutex
-	localConns     sync.Map
-	send           chan []byte
-	connected      atomic.Bool
-	sessionDone    atomic.Value // stores chan struct{}
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
-	connectHandler ConnectHandler
-	tokenProvider  TokenProvider
-	staticToken    TokenProvider
+	config              ClientBackendConfig
+	ws                  *websocket.Conn
+	wsMu                sync.Mutex
+	localConns          sync.Map
+	send                chan outboundMessage
+	connected           atomic.Bool
+	sessionDone         atomic.Value // stores chan struct{}
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	wg                  sync.WaitGroup
+	connectHandler      ConnectHandler
+	tokenProvider       TokenProvider
+	staticTokenProvider TokenProvider
 }
 
 // New creates a new Client instance for a specific backend configuration.
-func New(cfg ClientBackendConfig, opts ...Option) *Client {
+func New(cfg ClientBackendConfig, opts ...Option) (*Client, error) {
+	if cfg.Weight <= 0 {
+		cfg.Weight = 1
+	}
+
+	defaultProvider, err := buildDefaultProvider(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	c := &Client{
 		config: cfg,
-		send:   make(chan []byte, 256), // Buffered channel to handle outgoing messages
+		send:   make(chan outboundMessage, 256), // Buffered channel to handle outgoing messages
 	}
 	c.sessionDone.Store((chan struct{})(nil))
 
 	c.connectHandler = c.configBasedConnectHandler()
-	defaultTokenProvider := func(ctx context.Context) (Token, error) {
-		token := strings.TrimSpace(cfg.AuthToken)
-		if token == "" {
-			return Token{}, fmt.Errorf("client: static auth token is empty")
-		}
-		return Token{Value: token}, nil
-	}
-	c.staticToken = defaultTokenProvider
-	c.tokenProvider = defaultTokenProvider
+	c.staticTokenProvider = defaultProvider
+	c.tokenProvider = defaultProvider
 
 	for _, opt := range opts {
 		opt(c)
@@ -96,14 +111,31 @@ func New(cfg ClientBackendConfig, opts ...Option) *Client {
 	if c.connectHandler == nil {
 		c.connectHandler = c.configBasedConnectHandler()
 	}
-	if c.tokenProvider == nil {
-		c.tokenProvider = defaultTokenProvider
+	if c.staticTokenProvider == nil && c.tokenProvider != nil {
+		c.staticTokenProvider = c.tokenProvider
 	}
-	if c.staticToken == nil {
-		c.staticToken = defaultTokenProvider
+	if c.tokenProvider == nil {
+		if defaultProvider == nil {
+			return nil, fmt.Errorf("token provider not configured and no attestation mechanism supplied")
+		}
+		c.tokenProvider = defaultProvider
+	}
+	if c.staticTokenProvider == nil {
+		c.staticTokenProvider = defaultProvider
 	}
 
-	return c
+	return c, nil
+}
+
+func buildDefaultProvider(cfg ClientBackendConfig) (TokenProvider, error) {
+	opts := cfg.Attestation
+	if strings.TrimSpace(opts.Command) != "" {
+		return NewCommandTokenProvider(opts)
+	}
+	if strings.TrimSpace(opts.HMACSecret) != "" || strings.TrimSpace(opts.HMACSecretFile) != "" {
+		return NewHMACTokenProvider(opts, cfg.Name, cfg.Hostnames, cfg.Weight)
+	}
+	return nil, nil
 }
 
 // Start initiates the client's connection loop.
@@ -155,12 +187,27 @@ func (c *Client) Stop() {
 }
 
 func (c *Client) getAuthToken(ctx context.Context) (string, error) {
+	return c.issueToken(ctx, StageHandshake, "")
+}
+
+func (c *Client) issueToken(ctx context.Context, stage TokenStage, nonce string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	provider := c.tokenProvider
 	if provider == nil {
 		return "", fmt.Errorf("token provider not configured")
 	}
 
-	token, err := provider(ctx)
+	req := TokenRequest{
+		Stage:        stage,
+		SessionNonce: nonce,
+		BackendName:  c.config.Name,
+		Hostnames:    append([]string(nil), c.config.Hostnames...),
+		Weight:       c.config.Weight,
+	}
+
+	token, err := provider.IssueToken(ctx, req)
 	if err != nil {
 		return "", fmt.Errorf("token provider failed: %w", err)
 	}
@@ -179,24 +226,43 @@ func (c *Client) connectAndAuthenticate() error {
 		ctx = context.Background()
 	}
 
-	token, err := c.getAuthToken(ctx)
-	if err != nil {
-		return err
-	}
-
-	c.wsMu.Lock()
-	defer c.wsMu.Unlock()
-
 	ws, _, err := websocket.DefaultDialer.DialContext(ctx, c.config.NexusAddress, nil)
 	if err != nil {
 		return fmt.Errorf("dial failed: %w", err)
 	}
-	c.ws = ws
 
-	if err := c.ws.WriteMessage(websocket.TextMessage, []byte(token)); err != nil {
-		c.ws.Close()
-		return fmt.Errorf("auth failed: %w", err)
+	handshakeToken, err := c.issueToken(ctx, StageHandshake, "")
+	if err != nil {
+		ws.Close()
+		return fmt.Errorf("fetch handshake token: %w", err)
 	}
+
+	if err := ws.WriteMessage(websocket.TextMessage, []byte(handshakeToken)); err != nil {
+		ws.Close()
+		return fmt.Errorf("send handshake token: %w", err)
+	}
+
+	nonce, err := c.awaitChallenge(ws, "handshake_challenge")
+	if err != nil {
+		ws.Close()
+		return fmt.Errorf("handshake challenge: %w", err)
+	}
+
+	attestedToken, err := c.issueToken(ctx, StageAttest, nonce)
+	if err != nil {
+		ws.Close()
+		return fmt.Errorf("fetch attested token: %w", err)
+	}
+
+	if err := ws.WriteMessage(websocket.TextMessage, []byte(attestedToken)); err != nil {
+		ws.Close()
+		return fmt.Errorf("send attested token: %w", err)
+	}
+
+	c.wsMu.Lock()
+	c.ws = ws
+	c.wsMu.Unlock()
+
 	return nil
 }
 
@@ -217,68 +283,36 @@ func (c *Client) readPump() {
 	c.wsMu.Unlock()
 	defer ws.Close()
 
+	ws.SetReadLimit(maxMessageSize)
 	ws.SetReadDeadline(time.Now().Add(pongWait))
 	ws.SetPongHandler(func(string) error {
 		ws.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
 
-	type readResult struct {
-		msg []byte
-		err error
-	}
-
 	for {
-		resultCh := make(chan readResult, 1)
+		msgType, message, err := ws.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("ERROR: [%s] Unexpected close from Nexus: %v", c.config.Name, err)
+			}
+			return
+		}
 
-		go func() {
-			if ws == nil {
-				resultCh <- readResult{err: fmt.Errorf("connection is nil")}
+		ws.SetReadDeadline(time.Now().Add(pongWait))
+
+		switch msgType {
+		case websocket.BinaryMessage:
+			c.handleBinaryMessage(message)
+		case websocket.TextMessage:
+			if err := c.handleTextMessage(message); err != nil {
+				log.Printf("ERROR: [%s] Re-authentication failed: %v", c.config.Name, err)
 				return
 			}
-			msgType, msg, err := ws.ReadMessage()
-			if err != nil {
-				resultCh <- readResult{err: err}
-				return
-			}
-			if msgType != websocket.BinaryMessage || len(msg) < 1 {
-				resultCh <- readResult{err: fmt.Errorf("received non-binary message or too short payload: %d bytes", len(msg))}
-				return
-			}
-
-			resultCh <- readResult{msg: msg}
-		}()
-
-		select {
-		case <-c.ctx.Done():
-			// Context was canceled, time to shut down.
-			log.Println("readLoop: context done, closing connection.")
-			return // Exit the loop
-
-		case res := <-resultCh:
-			// An error occurred during ReadMessage.
-			if res.err != nil {
-				select {
-				case <-c.ctx.Done():
-					return
-				default:
-					log.Printf("ERROR: [%s] Error reading from Nexus: %v", c.config.Name, res.err)
-				}
-				return // Exit the loop
-			}
-
-			// We received a message. Process it.
-			controlByte := res.msg[0]
-			payload := res.msg[1:]
-
-			switch controlByte {
-			case controlByteControl:
-				c.handleControlMessage(payload)
-			case controlByteData:
-				c.handleDataMessage(payload)
-			default:
-				log.Printf("ERROR: [%s] Received unknown control byte: %d", c.config.Name, controlByte)
-			}
+		case websocket.CloseMessage:
+			return
+		default:
+			log.Printf("WARN: [%s] Ignoring unsupported WebSocket message type %d", c.config.Name, msgType)
 		}
 	}
 }
@@ -470,7 +504,12 @@ func (c *Client) copyLocalToNexus(client *clientConn) {
 			copy(header[1:], client.id[:])
 			message := append(header, buf[:n]...)
 
-			if err := c.enqueue(message); err != nil {
+			outbound := outboundMessage{
+				messageType: websocket.BinaryMessage,
+				payload:     message,
+			}
+
+			if err := c.enqueue(outbound); err != nil {
 				if !errors.Is(err, errSessionInactive) && !errors.Is(err, context.Canceled) {
 					log.Printf("WARN: [%s] Failed to enqueue data for ClientID %s: %v", c.config.Name, client.id, err)
 				}
@@ -497,7 +536,7 @@ func (c *Client) beginSession() chan struct{} {
 	return sessionCh
 }
 
-func (c *Client) enqueue(message []byte) error {
+func (c *Client) enqueue(message outboundMessage) error {
 	if !c.connected.Load() {
 		return errSessionInactive
 	}
@@ -556,8 +595,12 @@ func (c *Client) sendControlMessage(event string, clientID uuid.UUID) error {
 	}
 	header := []byte{controlByteControl}
 	message := append(header, payload...)
+	outbound := outboundMessage{
+		messageType: websocket.BinaryMessage,
+		payload:     message,
+	}
 
-	if err := c.enqueue(message); err != nil {
+	if err := c.enqueue(outbound); err != nil {
 		if errors.Is(err, errSessionInactive) {
 			log.Printf("DEBUG: [%s] Dropping control message '%s' for client %s: session inactive", c.config.Name, event, clientID)
 		} else if errors.Is(err, context.Canceled) {
@@ -603,8 +646,8 @@ func (c *Client) writePump(sessionCh chan struct{}) {
 				return
 			}
 			ws.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := ws.WriteMessage(websocket.BinaryMessage, message); err != nil {
-				log.Printf("ERROR: [%s] Failed to write binary message to Nexus: %v", c.config.Name, err)
+			if err := ws.WriteMessage(message.messageType, message.payload); err != nil {
+				log.Printf("ERROR: [%s] Failed to write message to Nexus: %v", c.config.Name, err)
 				return // Terminate the pump and session.
 			}
 		case <-ticker.C:
@@ -677,4 +720,92 @@ func (c *Client) healthCheckPump() {
 			return
 		}
 	}
+}
+func (c *Client) awaitChallenge(ws *websocket.Conn, expectedType string) (string, error) {
+	if err := ws.SetReadDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		return "", err
+	}
+	defer ws.SetReadDeadline(time.Time{})
+
+	messageType, payload, err := ws.ReadMessage()
+	if err != nil {
+		return "", err
+	}
+	if messageType != websocket.TextMessage {
+		return "", fmt.Errorf("expected text message during handshake, got type %d", messageType)
+	}
+
+	var challenge challengeMessage
+	if err := json.Unmarshal(payload, &challenge); err != nil {
+		return "", fmt.Errorf("decode challenge: %w", err)
+	}
+	if challenge.Type != expectedType {
+		return "", fmt.Errorf("unexpected challenge type %q", challenge.Type)
+	}
+	if strings.TrimSpace(challenge.Nonce) == "" {
+		return "", fmt.Errorf("challenge missing nonce")
+	}
+	return challenge.Nonce, nil
+}
+func (c *Client) handleBinaryMessage(message []byte) {
+	if len(message) < 1 {
+		log.Printf("WARN: [%s] Received empty binary message from Nexus", c.config.Name)
+		return
+	}
+
+	controlByte := message[0]
+	payload := message[1:]
+
+	switch controlByte {
+	case controlByteControl:
+		c.handleControlMessage(payload)
+	case controlByteData:
+		c.handleDataMessage(payload)
+	default:
+		log.Printf("ERROR: [%s] Received unknown control byte: %d", c.config.Name, controlByte)
+	}
+}
+
+func (c *Client) handleTextMessage(message []byte) error {
+	var challenge challengeMessage
+	if err := json.Unmarshal(message, &challenge); err != nil {
+		log.Printf("WARN: [%s] Failed to decode text message from Nexus: %v", c.config.Name, err)
+		return nil
+	}
+
+	switch challenge.Type {
+	case "reauth_challenge":
+		if strings.TrimSpace(challenge.Nonce) == "" {
+			return fmt.Errorf("reauth challenge missing nonce")
+		}
+		return c.handleReauthChallenge(challenge.Nonce)
+	case "handshake_challenge":
+		// Should not occur after initial handshake; ignore quietly.
+		log.Printf("WARN: [%s] Received unexpected handshake challenge after session establishment", c.config.Name)
+	default:
+		log.Printf("WARN: [%s] Ignoring unknown text message type '%s' from Nexus", c.config.Name, challenge.Type)
+	}
+	return nil
+}
+
+func (c *Client) handleReauthChallenge(nonce string) error {
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	token, err := c.issueToken(ctx, StageReauth, nonce)
+	if err != nil {
+		return fmt.Errorf("issue reauth token: %w", err)
+	}
+
+	outbound := outboundMessage{
+		messageType: websocket.TextMessage,
+		payload:     []byte(token),
+	}
+
+	if err := c.enqueue(outbound); err != nil {
+		return fmt.Errorf("enqueue reauth token: %w", err)
+	}
+	return nil
 }

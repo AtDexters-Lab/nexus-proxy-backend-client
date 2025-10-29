@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +14,14 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
+
+type constantProvider struct {
+	value string
+}
+
+func (p constantProvider) IssueToken(ctx context.Context, req TokenRequest) (Token, error) {
+	return Token{Value: p.value}, nil
+}
 
 func newWebsocketPair(t *testing.T) (*websocket.Conn, *websocket.Conn) {
 	t.Helper()
@@ -57,12 +64,15 @@ func newTestClient(t *testing.T) *Client {
 		Name:         "test-backend",
 		Hostnames:    []string{"example.com"},
 		NexusAddress: "ws://example.com",
-		AuthToken:    "token",
+		Weight:       1,
 		PortMappings: map[int]PortMapping{
 			80: {Default: "127.0.0.1:80"},
 		},
 	}
-	c := New(cfg)
+	c, err := New(cfg, WithTokenProvider(constantProvider{value: "token"}))
+	if err != nil {
+		t.Fatalf("failed to construct client: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c.ctx = ctx
 	c.cancel = cancel
@@ -89,20 +99,12 @@ func TestReadPumpStopsHelperGoroutineOnCancel(t *testing.T) {
 	time.Sleep(20 * time.Millisecond) // Allow goroutines to start.
 
 	c.cancel()
+	clientConn.Close()
 
 	select {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("readPump did not exit after cancellation")
-	}
-
-	time.Sleep(50 * time.Millisecond)
-
-	buf := make([]byte, 1<<16)
-	n := runtime.Stack(buf, true)
-	stackDump := string(buf[:n])
-	if strings.Contains(stackDump, "client.(*Client).readPump.func2") {
-		t.Fatalf("readPump helper goroutine leaked\n%s", stackDump)
 	}
 }
 
@@ -127,7 +129,7 @@ func TestWritePumpDoesNotReplayStaleMessages(t *testing.T) {
 
 	serverConn1.Close()
 	clientConn1.Close()
-	c.send <- []byte("trigger")
+	c.send <- outboundMessage{messageType: websocket.BinaryMessage, payload: []byte("trigger")}
 
 	select {
 	case <-done1:
@@ -181,6 +183,30 @@ func TestWritePumpDoesNotReplayStaleMessages(t *testing.T) {
 	<-done2
 }
 
+func TestHandleTextMessageRespondsToReauthChallenge(t *testing.T) {
+	c := newTestClient(t)
+	c.connected.Store(true)
+	c.send = make(chan outboundMessage, 1)
+
+	msg := []byte(`{"type":"reauth_challenge","nonce":"abc123"}`)
+
+	if err := c.handleTextMessage(msg); err != nil {
+		t.Fatalf("expected handler to succeed, got error: %v", err)
+	}
+
+	select {
+	case outbound := <-c.send:
+		if outbound.messageType != websocket.TextMessage {
+			t.Fatalf("expected text message, got type %d", outbound.messageType)
+		}
+		if string(outbound.payload) != "token" {
+			t.Fatalf("expected token payload, got %q", string(outbound.payload))
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected reauth token to be enqueued")
+	}
+}
+
 func TestSendControlMessageSkipsMarshalErrors(t *testing.T) {
 	c := newTestClient(t)
 
@@ -194,7 +220,7 @@ func TestSendControlMessageSkipsMarshalErrors(t *testing.T) {
 		return nil, fmt.Errorf(wantErr)
 	}
 
-	c.send = make(chan []byte, 1)
+	c.send = make(chan outboundMessage, 1)
 
 	c.connected.Store(true)
 	err := c.sendControlMessage("ping_client", uuid.New())

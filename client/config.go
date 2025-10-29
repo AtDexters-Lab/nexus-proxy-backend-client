@@ -21,12 +21,30 @@ type HealthCheckConfig struct {
 	PongTimeout       int  `yaml:"pongTimeout"`
 }
 
+type AttestationConfig struct {
+	Command                    string            `yaml:"command"`
+	Args                       []string          `yaml:"args"`
+	Env                        map[string]string `yaml:"env"`
+	TimeoutSeconds             int               `yaml:"timeoutSeconds"`
+	CacheHandshakeSeconds      int               `yaml:"cacheHandshakeSeconds"`
+	HMACSecret                 string            `yaml:"hmacSecret"`
+	HMACSecretFile             string            `yaml:"hmacSecretFile"`
+	TokenTTLSeconds            int               `yaml:"tokenTTLSeconds"`
+	HandshakeMaxAgeSeconds     int               `yaml:"handshakeMaxAgeSeconds"`
+	ReauthIntervalSeconds      int               `yaml:"reauthIntervalSeconds"`
+	ReauthGraceSeconds         int               `yaml:"reauthGraceSeconds"`
+	MaintenanceGraceCapSeconds int               `yaml:"maintenanceGraceCapSeconds"`
+	AuthorizerStatusURI        string            `yaml:"authorizerStatusUri"`
+	PolicyVersion              string            `yaml:"policyVersion"`
+}
+
 type BackendConfig struct {
 	Name           string              `yaml:"name"`
 	Hostname       string              `yaml:"hostname"`
 	Hostnames      []string            `yaml:"hostnames"`
 	NexusAddresses []string            `yaml:"nexusAddresses"`
-	AuthToken      string              `yaml:"authToken"`
+	Weight         int                 `yaml:"weight"`
+	Attestation    AttestationConfig   `yaml:"attestation"`
 	PortMappings   map[int]PortMapping `yaml:"portMappings"`
 	HealthChecks   HealthCheckConfig   `yaml:"healthChecks"`
 }
@@ -195,9 +213,45 @@ func LoadConfig(path string) (*Config, error) {
 		if len(b.NexusAddresses) == 0 {
 			return nil, fmt.Errorf("backend '%s': nexusAddresses is required", b.Name)
 		}
-		if b.AuthToken == "" {
-			return nil, fmt.Errorf("backend '%s': authToken is required", b.Name)
+		if b.Weight <= 0 {
+			b.Weight = 1
 		}
+		hasCommand := strings.TrimSpace(b.Attestation.Command) != ""
+		b.Attestation.HMACSecret = strings.TrimSpace(b.Attestation.HMACSecret)
+		b.Attestation.HMACSecretFile = strings.TrimSpace(b.Attestation.HMACSecretFile)
+		hasSecret := b.Attestation.HMACSecret != "" || b.Attestation.HMACSecretFile != ""
+		if !hasCommand && !hasSecret {
+			return nil, fmt.Errorf("backend '%s': attestation requires either command or hmacSecret(/File)", b.Name)
+		}
+		if b.Attestation.TimeoutSeconds < 0 {
+			return nil, fmt.Errorf("backend '%s': attestation.timeoutSeconds cannot be negative", b.Name)
+		}
+		if b.Attestation.TimeoutSeconds == 0 {
+			b.Attestation.TimeoutSeconds = 15
+		}
+		if b.Attestation.CacheHandshakeSeconds < 0 {
+			return nil, fmt.Errorf("backend '%s': attestation.cacheHandshakeSeconds cannot be negative", b.Name)
+		}
+		if b.Attestation.TokenTTLSeconds < 0 {
+			return nil, fmt.Errorf("backend '%s': attestation.tokenTTLSeconds cannot be negative", b.Name)
+		}
+		if b.Attestation.TokenTTLSeconds == 0 {
+			b.Attestation.TokenTTLSeconds = 30
+		}
+		if b.Attestation.HandshakeMaxAgeSeconds < 0 {
+			return nil, fmt.Errorf("backend '%s': attestation.handshakeMaxAgeSeconds cannot be negative", b.Name)
+		}
+		if b.Attestation.ReauthIntervalSeconds < 0 {
+			return nil, fmt.Errorf("backend '%s': attestation.reauthIntervalSeconds cannot be negative", b.Name)
+		}
+		if b.Attestation.ReauthGraceSeconds < 0 {
+			return nil, fmt.Errorf("backend '%s': attestation.reauthGraceSeconds cannot be negative", b.Name)
+		}
+		if b.Attestation.MaintenanceGraceCapSeconds < 0 {
+			return nil, fmt.Errorf("backend '%s': attestation.maintenanceGraceCapSeconds cannot be negative", b.Name)
+		}
+		b.Attestation.AuthorizerStatusURI = strings.TrimSpace(b.Attestation.AuthorizerStatusURI)
+		b.Attestation.PolicyVersion = strings.TrimSpace(b.Attestation.PolicyVersion)
 		if len(b.PortMappings) == 0 {
 			return nil, fmt.Errorf("backend '%s': at least one portMapping is required", b.Name)
 		}

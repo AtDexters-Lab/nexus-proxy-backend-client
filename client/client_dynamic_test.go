@@ -10,12 +10,24 @@ import (
 	"github.com/google/uuid"
 )
 
+type trackingProvider struct {
+	value   string
+	onIssue func()
+}
+
+func (p *trackingProvider) IssueToken(ctx context.Context, req TokenRequest) (Token, error) {
+	if p.onIssue != nil {
+		p.onIssue()
+	}
+	return Token{Value: p.value}, nil
+}
+
 func TestClientWithCustomConnectHandler(t *testing.T) {
 	cfg := ClientBackendConfig{
 		Name:         "dynamic",
 		Hostnames:    []string{"hello.example.com"},
 		NexusAddress: "wss://nexus.example.com/connect",
-		AuthToken:    "token",
+		Weight:       1,
 		PortMappings: map[int]PortMapping{
 			80: {Default: "localhost:8080"},
 		},
@@ -35,7 +47,10 @@ func TestClientWithCustomConnectHandler(t *testing.T) {
 		return server, nil
 	}
 
-	c := New(cfg, WithConnectHandler(handler))
+	c, err := New(cfg, WithConnectHandler(handler), WithTokenProvider(constantProvider{value: "token"}))
+	if err != nil {
+		t.Fatalf("failed to construct client: %v", err)
+	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	defer c.cancel()
 
@@ -102,56 +117,73 @@ func TestClientWithCustomConnectHandler(t *testing.T) {
 	t.Fatalf("expected client connection cleanup after handler close")
 }
 
-func TestClientGetAuthToken_DefaultProvider(t *testing.T) {
+func TestClientGetAuthTokenUsesProvider(t *testing.T) {
 	cfg := ClientBackendConfig{
-		Name:         "default-token",
+		Name:         "provider-token",
 		Hostnames:    []string{"example.com"},
 		NexusAddress: "wss://nexus.example.com/connect",
-		AuthToken:    "  static-token  ",
+		Weight:       1,
 		PortMappings: map[int]PortMapping{
 			80: {Default: "localhost:8080"},
 		},
 	}
 
-	c := New(cfg)
+	var calls int
+	provider := &trackingProvider{
+		value: "provided-token",
+		onIssue: func() {
+			calls++
+		},
+	}
+
+	c, err := New(cfg, WithTokenProvider(provider))
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
 
 	token, err := c.getAuthToken(context.Background())
 	if err != nil {
 		t.Fatalf("expected token, got error: %v", err)
 	}
-	if token != "static-token" {
-		t.Fatalf("expected trimmed token value, got %q", token)
+	if token != "provided-token" {
+		t.Fatalf("expected provider token, got %q", token)
+	}
+	if calls != 1 {
+		t.Fatalf("expected provider to be invoked exactly once, got %d calls", calls)
 	}
 }
 
-func TestClientGetAuthToken_WithTokenProvider(t *testing.T) {
+func TestWithTokenProviderOverrides(t *testing.T) {
 	cfg := ClientBackendConfig{
 		Name:         "dynamic-token",
 		Hostnames:    []string{"example.com"},
 		NexusAddress: "wss://nexus.example.com/connect",
-		AuthToken:    "unused",
+		Weight:       1,
 		PortMappings: map[int]PortMapping{
 			80: {Default: "localhost:8080"},
 		},
 	}
 
-	var callCount int
-	provider := func(ctx context.Context) (Token, error) {
-		callCount++
-		return Token{Value: "dynamic-token-value"}, nil
+	c, err := New(cfg, WithTokenProvider(constantProvider{value: "first"}))
+	if err != nil {
+		t.Fatalf("failed to construct client: %v", err)
 	}
-
-	c := New(cfg, WithTokenProvider(provider))
 
 	token, err := c.getAuthToken(context.Background())
 	if err != nil {
-		t.Fatalf("expected token from provider, got error: %v", err)
+		t.Fatalf("expected token, got error: %v", err)
 	}
-	if token != "dynamic-token-value" {
-		t.Fatalf("expected token from provider, got %q", token)
+	if token != "first" {
+		t.Fatalf("expected first provider token, got %q", token)
 	}
-	if callCount != 1 {
-		t.Fatalf("expected provider to be invoked once, got %d calls", callCount)
+
+	WithTokenProvider(constantProvider{value: "second"})(c)
+	token, err = c.getAuthToken(context.Background())
+	if err != nil {
+		t.Fatalf("expected token after override, got error: %v", err)
+	}
+	if token != "second" {
+		t.Fatalf("expected second provider token, got %q", token)
 	}
 }
 
@@ -160,13 +192,16 @@ func TestWithTokenProviderNilResetsToStatic(t *testing.T) {
 		Name:         "reset-token",
 		Hostnames:    []string{"example.com"},
 		NexusAddress: "wss://nexus.example.com/connect",
-		AuthToken:    "static-token",
+		Weight:       1,
 		PortMappings: map[int]PortMapping{
 			80: {Default: "localhost:8080"},
 		},
 	}
 
-	c := New(cfg)
+	c, err := New(cfg, WithTokenProvider(constantProvider{value: "static-token"}))
+	if err != nil {
+		t.Fatalf("failed to construct client: %v", err)
+	}
 
 	initial, err := c.getAuthToken(context.Background())
 	if err != nil {
@@ -176,13 +211,7 @@ func TestWithTokenProviderNilResetsToStatic(t *testing.T) {
 		t.Fatalf("expected initial static token, got %q", initial)
 	}
 
-	var dynamicCalls int
-	dynamicProvider := func(ctx context.Context) (Token, error) {
-		dynamicCalls++
-		return Token{Value: "dynamic"}, nil
-	}
-
-	WithTokenProvider(dynamicProvider)(c)
+	WithTokenProvider(constantProvider{value: "dynamic"})(c)
 	dynamic, err := c.getAuthToken(context.Background())
 	if err != nil {
 		t.Fatalf("expected dynamic token, got error: %v", err)
@@ -190,11 +219,7 @@ func TestWithTokenProviderNilResetsToStatic(t *testing.T) {
 	if dynamic != "dynamic" {
 		t.Fatalf("expected dynamic token, got %q", dynamic)
 	}
-	if dynamicCalls != 1 {
-		t.Fatalf("expected dynamic provider to be called once, got %d", dynamicCalls)
-	}
 
-	dynamicCalls = 0
 	WithTokenProvider(nil)(c)
 	reset, err := c.getAuthToken(context.Background())
 	if err != nil {
@@ -202,8 +227,5 @@ func TestWithTokenProviderNilResetsToStatic(t *testing.T) {
 	}
 	if reset != "static-token" {
 		t.Fatalf("expected reset static token, got %q", reset)
-	}
-	if dynamicCalls != 0 {
-		t.Fatalf("expected dynamic provider not to be called after reset, got %d calls", dynamicCalls)
 	}
 }
