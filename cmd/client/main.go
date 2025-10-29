@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/AtDexters-Lab/nexus-proxy-backend-client/client"
 )
@@ -32,13 +33,33 @@ func main() {
 			wg.Add(1)
 			go func(cfg client.ClientBackendConfig) {
 				defer wg.Done()
-				c := client.New(cfg)
+				c, err := client.New(cfg)
+				if err != nil {
+					log.Printf("ERROR: Failed to construct client for backend %s targeting %s: %v", cfg.Name, cfg.NexusAddress, err)
+					return
+				}
 				c.Start(ctx)
 			}(client.ClientBackendConfig{
 				Name:         backendCfg.Name,
 				Hostnames:    append([]string(nil), backendCfg.Hostnames...),
 				NexusAddress: nexusAddr,
-				AuthToken:    backendCfg.AuthToken,
+				Weight:       backendCfg.Weight,
+				Attestation: client.AttestationOptions{
+					Command:                    backendCfg.Attestation.Command,
+					Args:                       append([]string(nil), backendCfg.Attestation.Args...),
+					Env:                        copyStringMap(backendCfg.Attestation.Env),
+					Timeout:                    time.Duration(backendCfg.Attestation.TimeoutSeconds) * time.Second,
+					CacheHandshake:             time.Duration(backendCfg.Attestation.CacheHandshakeSeconds) * time.Second,
+					HMACSecret:                 backendCfg.Attestation.HMACSecret,
+					HMACSecretFile:             backendCfg.Attestation.HMACSecretFile,
+					TokenTTL:                   time.Duration(backendCfg.Attestation.TokenTTLSeconds) * time.Second,
+					HandshakeMaxAgeSeconds:     backendCfg.Attestation.HandshakeMaxAgeSeconds,
+					ReauthIntervalSeconds:      backendCfg.Attestation.ReauthIntervalSeconds,
+					ReauthGraceSeconds:         backendCfg.Attestation.ReauthGraceSeconds,
+					MaintenanceGraceCapSeconds: backendCfg.Attestation.MaintenanceGraceCapSeconds,
+					AuthorizerStatusURI:        backendCfg.Attestation.AuthorizerStatusURI,
+					PolicyVersion:              backendCfg.Attestation.PolicyVersion,
+				},
 				PortMappings: backendCfg.PortMappings,
 				HealthChecks: backendCfg.HealthChecks,
 			})
@@ -55,4 +76,15 @@ func main() {
 
 	wg.Wait() // Wait for all clients to finish cleaning up.
 	log.Println("INFO: All clients have shut down gracefully. Exiting.")
+}
+
+func copyStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }

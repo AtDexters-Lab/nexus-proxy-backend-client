@@ -96,7 +96,8 @@ func TestLoadConfigRejectsUnknownPortMappingField(t *testing.T) {
       - "example.com"
     nexusAddresses:
       - "wss://nexus.example.com/connect"
-    authToken: "token"
+    attestation:
+      command: "/usr/bin/true"
     portMappings:
       80:
         default: "localhost:8080"
@@ -111,5 +112,56 @@ func TestLoadConfigRejectsUnknownPortMappingField(t *testing.T) {
 
 	if _, err := LoadConfig(path); err == nil {
 		t.Fatal("expected error due to unknown 'hostnames' field in port mapping")
+	}
+}
+
+func TestLoadConfigRequiresAttestationMechanism(t *testing.T) {
+	configYAML := `backends:
+  - name: "missing"
+    hostnames:
+      - "example.com"
+    nexusAddresses:
+      - "wss://nexus.example.com/connect"
+    portMappings:
+      80:
+        default: "localhost:8080"
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(configYAML), 0o600); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("expected error because no attestation command or secret configured")
+	}
+}
+
+func TestLoadConfigAllowsHMACSecret(t *testing.T) {
+	configYAML := `backends:
+  - name: "hmac"
+    hostnames:
+      - "example.com"
+    nexusAddresses:
+      - "wss://nexus.example.com/connect"
+    attestation:
+      hmacSecret: "top-secret"
+    portMappings:
+      80:
+        default: "localhost:8080"
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(configYAML), 0o600); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("expected config to load, got error: %v", err)
+	}
+	if cfg.Backends[0].Attestation.HMACSecret != "top-secret" {
+		t.Fatalf("expected hmac secret to be preserved")
+	}
+	if cfg.Backends[0].Attestation.TokenTTLSeconds != 30 {
+		t.Fatalf("expected default token TTL of 30 seconds, got %d", cfg.Backends[0].Attestation.TokenTTLSeconds)
 	}
 }

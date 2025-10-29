@@ -10,8 +10,17 @@ backends:
     nexusAddresses:
       - "wss://nexus-1.example.com/connect"
       - "wss://nexus-2.example.com/connect"
-    # The full, pre-signed JWT obtained from a central authorizer.
-    authToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+    # Optional weight advertised to Nexus for load-balancing decisions (defaults to 1).
+    weight: 2
+    # Command that obtains handshake and attested tokens from your authorizer.
+    attestation:
+      command: "/usr/local/bin/nexus-attestor"
+      args:
+        - "--backend=edge-apps"
+      env:
+        AUTHORIZER_BASE_URL: "https://authorizer.example.com"
+      timeoutSeconds: 20
+      cacheHandshakeSeconds: 30
     # A map of public-facing relay ports on Nexus to local service targets.
     portMappings:
       443:
@@ -35,6 +44,10 @@ backends:
       - "imap.example.com"
     nexusAddresses:
       - "wss://nexus.example.com/connect"
-    authToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+    attestation:
+      hmacSecretFile: "/etc/nexus/email-hmac.key"
+      tokenTTLSeconds: 45
+      reauthIntervalSeconds: 900
+      reauthGraceSeconds: 15
     portMappings:
       993: "localhost:993" # Relay secure IMAP (IMAPS) traffic
