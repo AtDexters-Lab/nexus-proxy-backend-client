@@ -2,11 +2,15 @@ package client
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -19,12 +23,33 @@ import (
 
 var jsonMarshal = json.Marshal
 
+// jitterRand is a local random source seeded with crypto/rand for unpredictable backoff jitter.
+// This prevents synchronized reconnection patterns across multiple client instances.
+// Protected by jitterMu for thread-safe concurrent access.
+var (
+	jitterRand *rand.Rand
+	jitterMu   sync.Mutex
+)
+
+func init() {
+	var seed int64
+	if err := binary.Read(crand.Reader, binary.LittleEndian, &seed); err != nil {
+		// Fallback to time-based seed if crypto/rand fails (should never happen)
+		seed = time.Now().UnixNano()
+	}
+	jitterRand = rand.New(rand.NewSource(seed))
+}
+
 const (
 	clientIDLength      = 16
 	controlByteData     = 0x01
 	controlByteControl  = 0x02
-	reconnectDelay      = 5 * time.Second
 	healthCheckInterval = 5 * time.Second
+
+	// Reconnection backoff parameters
+	baseReconnectDelay = 5 * time.Second  // Initial delay between reconnection attempts
+	maxReconnectDelay  = 60 * time.Second // Maximum delay cap
+	jitterFactor       = 0.25             // ±25% jitter to prevent thundering herd
 
 	writeToNexusBufferSize = 1024 * 16 // The server specifies a maximum read size of 32KB + 17 bytes for the header, so 16KB is a safe size.
 	// connection health check parameters
@@ -37,6 +62,27 @@ const (
 
 var errSessionInactive = errors.New("client session inactive")
 
+// backoffDelay calculates the reconnection delay with exponential backoff and jitter.
+// The delay doubles with each retry up to maxReconnectDelay, with ±25% jitter.
+// Uses a crypto-seeded random source to prevent synchronized reconnection patterns.
+// Thread-safe for concurrent use by multiple Client instances.
+func backoffDelay(retries int) time.Duration {
+	delay := float64(baseReconnectDelay) * math.Pow(2, float64(retries))
+	if delay > float64(maxReconnectDelay) {
+		delay = float64(maxReconnectDelay)
+	}
+	// Add jitter: ±25% of the delay (using crypto-seeded source, mutex-protected)
+	jitterMu.Lock()
+	jitter := delay * jitterFactor * (jitterRand.Float64()*2 - 1)
+	jitterMu.Unlock()
+	result := delay + jitter
+	// Cap final result to enforce maxReconnectDelay even after positive jitter
+	if result > float64(maxReconnectDelay) {
+		result = float64(maxReconnectDelay)
+	}
+	return time.Duration(result)
+}
+
 type outboundMessage struct {
 	messageType int
 	payload     []byte
@@ -48,13 +94,66 @@ type challengeMessage struct {
 }
 
 // clientConn represents a single proxied connection to the local service.
+// conn may be nil while dial is in progress (pending state).
 type clientConn struct {
 	id           uuid.UUID
-	conn         net.Conn
+	connMu       sync.Mutex  // Protects conn field during assignment/close race window
+	conn         net.Conn    // nil while dial is pending; protected by connMu during mutation
 	hostname     string
 	lastActivity atomic.Int64 // Unix timestamp of the last activity.
 	pingSent     atomic.Bool  // True if an inactivity ping has been sent.
+	pending      atomic.Bool  // True while dial is in progress
 	quit         chan struct{}
+	writeCh      chan []byte  // Buffered channel for non-blocking writes to local conn
+	closeOnce    sync.Once    // Ensures connection is closed only once
+	pongTimer    *time.Timer  // Timer for pong timeout, can be cancelled
+	pongTimerMu  sync.Mutex   // Protects pongTimer access
+}
+
+const (
+	// Per-connection write buffer size
+	localConnWriteBuffer = 64
+	// Dial timeout for local connections
+	localDialTimeout = 10 * time.Second
+	// Write timeout for local connections
+	localWriteTimeout = 10 * time.Second
+)
+
+// safeClose closes the connection and quit channel exactly once, preventing double-close panics.
+// Safe to call even if conn is nil (pending dial).
+func (cc *clientConn) safeClose() {
+	cc.closeOnce.Do(func() {
+		// Cancel pong timer first to prevent timer callback from racing with close
+		cc.cancelPongTimer()
+		close(cc.quit)
+		// Use mutex to safely read conn (may be concurrently assigned by establishLocalConnection)
+		cc.connMu.Lock()
+		conn := cc.conn
+		cc.connMu.Unlock()
+		if conn != nil {
+			conn.Close()
+		}
+	})
+}
+
+// cancelPongTimer stops the pong timeout timer if it's running.
+func (cc *clientConn) cancelPongTimer() {
+	cc.pongTimerMu.Lock()
+	defer cc.pongTimerMu.Unlock()
+	if cc.pongTimer != nil {
+		cc.pongTimer.Stop()
+		cc.pongTimer = nil
+	}
+}
+
+// setPongTimer sets a new pong timeout timer, cancelling any existing one.
+func (cc *clientConn) setPongTimer(d time.Duration, f func()) {
+	cc.pongTimerMu.Lock()
+	defer cc.pongTimerMu.Unlock()
+	if cc.pongTimer != nil {
+		cc.pongTimer.Stop()
+	}
+	cc.pongTimer = time.AfterFunc(d, f)
 }
 
 type ClientBackendConfig struct {
@@ -78,7 +177,8 @@ type Client struct {
 	sessionDone         atomic.Value // stores chan struct{}
 	ctx                 context.Context
 	cancel              context.CancelFunc
-	wg                  sync.WaitGroup
+	wg                  sync.WaitGroup // Tracks readPump and writePump per session
+	healthWg            sync.WaitGroup // Tracks healthCheckPump goroutine
 	connectHandler      ConnectHandler
 	tokenProvider       TokenProvider
 	staticTokenProvider TokenProvider
@@ -146,8 +246,16 @@ func (c *Client) Start(ctx context.Context) {
 	log.Printf("INFO: [%s] Manager started for hostnames: %s", c.config.Name, strings.Join(c.config.Hostnames, ", "))
 
 	// Start the health check pump to monitor connection health.
-	go c.healthCheckPump()
+	c.healthWg.Add(1)
+	go func() {
+		defer c.healthWg.Done()
+		c.healthCheckPump()
+	}()
 
+	// Start the network state watcher for fast recovery (Linux only, best-effort)
+	networkWakeup := c.watchNetworkState()
+
+	retries := 0
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -157,11 +265,37 @@ func (c *Client) Start(ctx context.Context) {
 		}
 
 		if err := c.connectAndAuthenticate(); err != nil {
-			log.Printf("WARN: [%s] Failed to connect and authenticate: %v. Retrying in %s...", c.config.Name, err, reconnectDelay)
-			time.Sleep(reconnectDelay)
+			delay := backoffDelay(retries)
+			log.Printf("WARN: [%s] Failed to connect and authenticate: %v. Retrying in %s (attempt %d)...", c.config.Name, err, delay.Round(time.Millisecond), retries+1)
+			retries++
+
+			// Wait for backoff delay, but allow early wakeup on network state change
+			select {
+			case <-c.ctx.Done():
+				return
+			case _, ok := <-networkWakeup:
+				if !ok {
+					// Channel closed (netlink watcher exited), disable network wakeup
+					networkWakeup = nil
+					log.Printf("DEBUG: [%s] Network watcher stopped, falling back to timer-based backoff", c.config.Name)
+					// Still honor the backoff delay for this iteration
+					select {
+					case <-c.ctx.Done():
+						return
+					case <-time.After(delay):
+					}
+				} else {
+					log.Printf("INFO: [%s] Network state changed, retrying immediately.", c.config.Name)
+					retries = 0 // Reset backoff on network change
+				}
+			case <-time.After(delay):
+				// Normal backoff delay elapsed
+			}
 			continue
 		}
 
+		// Connection successful, reset retry counter
+		retries = 0
 		log.Printf("INFO: [%s] Connection established and authenticated. Starting pumps.", c.config.Name)
 
 		sessionCh := c.beginSession()
@@ -174,6 +308,7 @@ func (c *Client) Start(ctx context.Context) {
 
 		c.wg.Wait() // Wait for pumps to exit, indicating a disconnection.
 		c.clearSendQueue()
+		c.closeAllLocalConns() // Close all local connections; they can't be resumed across sessions
 		log.Printf("INFO: [%s] Disconnected from Nexus Proxy.", c.config.Name)
 	}
 }
@@ -266,13 +401,23 @@ func (c *Client) connectAndAuthenticate() error {
 	return nil
 }
 
-func (c *Client) cleanup() {
+// closeAllLocalConns closes all active local connections.
+// Called on WS session end since connections cannot be resumed across sessions.
+func (c *Client) closeAllLocalConns() {
 	c.localConns.Range(func(key, value interface{}) bool {
 		if conn, ok := value.(*clientConn); ok {
-			conn.conn.Close()
+			conn.safeClose()
 		}
+		c.localConns.Delete(key)
 		return true
 	})
+}
+
+func (c *Client) cleanup() {
+	// Wait for the health check pump to exit
+	c.healthWg.Wait()
+
+	c.closeAllLocalConns()
 	log.Printf("INFO: [%s] Client cleanup complete.", c.config.Name)
 }
 
@@ -349,26 +494,20 @@ func (c *Client) handleControlMessage(payload []byte) {
 			IsTLS:            msg.IsTLS,
 		}
 
-		conn, err := c.openBackendConnection(req)
-		if err != nil {
-			if errors.Is(err, ErrNoRoute) {
-				log.Printf("ERROR: [%s] No route configured for hostname '%s' on port %d", c.config.Name, msg.Hostname, msg.ConnPort)
-			} else {
-				log.Printf("ERROR: [%s] Failed to establish local connection for client %s: %v", c.config.Name, msg.ClientID, err)
-			}
-			return
-		}
-
-		newClient := &clientConn{
+		// Create pending connection immediately to buffer early data while dial is in progress
+		pendingClient := &clientConn{
 			id:       msg.ClientID,
-			conn:     conn,
+			conn:     nil, // Set after dial completes
 			hostname: normalizedHost,
 			quit:     make(chan struct{}),
+			writeCh:  make(chan []byte, localConnWriteBuffer),
 		}
-		newClient.lastActivity.Store(time.Now().Unix())
-		c.localConns.Store(msg.ClientID, newClient)
+		pendingClient.pending.Store(true)
+		pendingClient.lastActivity.Store(time.Now().Unix())
+		c.localConns.Store(msg.ClientID, pendingClient)
 
-		go c.copyLocalToNexus(newClient)
+		// Spawn goroutine for dial to avoid blocking readPump
+		go c.establishLocalConnection(req, pendingClient)
 
 	case "disconnect":
 		log.Printf("INFO: [%s] Received 'disconnect' for ClientID: %s. Closing local connection.", c.config.Name, msg.ClientID)
@@ -377,8 +516,7 @@ func (c *Client) handleControlMessage(payload []byte) {
 				if conn.hostname != "" {
 					log.Printf("DEBUG: [%s] Disconnecting client %s for hostname %s", c.config.Name, msg.ClientID, conn.hostname)
 				}
-				close(conn.quit)
-				conn.conn.Close()
+				conn.safeClose()
 				c.localConns.Delete(msg.ClientID)
 			}
 		}
@@ -387,6 +525,7 @@ func (c *Client) handleControlMessage(payload []byte) {
 		log.Printf("DEBUG: [%s] Received pong for client %s", c.config.Name, msg.ClientID)
 		if val, ok := c.localConns.Load(msg.ClientID); ok {
 			if conn, ok := val.(*clientConn); ok {
+				conn.cancelPongTimer() // Cancel the pong timeout timer
 				conn.pingSent.Store(false)
 				conn.lastActivity.Store(time.Now().Unix())
 			}
@@ -402,15 +541,17 @@ func (c *Client) resolveLocalAddress(port int, hostname string) (string, bool) {
 	return mapping.Resolve(hostname)
 }
 
-func (c *Client) openBackendConnection(req ConnectRequest) (net.Conn, error) {
+func (c *Client) openBackendConnection(ctx context.Context, req ConnectRequest) (net.Conn, error) {
 	handler := c.connectHandler
 	if handler == nil {
 		return nil, fmt.Errorf("connect handler not configured")
 	}
 
-	ctx := c.ctx
 	if ctx == nil {
-		ctx = context.Background()
+		ctx = c.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
 	}
 
 	conn, err := handler(ctx, req)
@@ -434,6 +575,107 @@ func (c *Client) configBasedConnectHandler() ConnectHandler {
 	}
 }
 
+// establishLocalConnection dials the local service and completes the pending connection.
+// The pendingClient is already stored in localConns to buffer early data during dial.
+func (c *Client) establishLocalConnection(req ConnectRequest, pendingClient *clientConn) {
+	// Use a timeout context for the dial operation
+	dialCtx, cancel := context.WithTimeout(c.ctx, localDialTimeout)
+	defer cancel()
+
+	conn, err := c.openBackendConnection(dialCtx, req)
+	if err != nil {
+		if dialCtx.Err() != nil {
+			log.Printf("ERROR: [%s] Dial timeout for client %s to hostname '%s'", c.config.Name, req.ClientID, pendingClient.hostname)
+		} else if errors.Is(err, ErrNoRoute) {
+			log.Printf("ERROR: [%s] No route configured for hostname '%s' on port %d", c.config.Name, pendingClient.hostname, req.Port)
+		} else {
+			log.Printf("ERROR: [%s] Failed to establish local connection for client %s: %v", c.config.Name, req.ClientID, err)
+		}
+		// Clean up pending connection and notify Nexus
+		pendingClient.safeClose()
+		c.localConns.Delete(req.ClientID)
+		if err := c.sendControlMessage("disconnect", req.ClientID); err != nil {
+			log.Printf("DEBUG: [%s] Failed to send disconnect for client %s after dial failure: %v", c.config.Name, req.ClientID, err)
+		}
+		return
+	}
+
+	// Check if session is still active after dial (handles shutdown race)
+	if !c.connected.Load() {
+		conn.Close()
+		pendingClient.safeClose()
+		c.localConns.Delete(req.ClientID)
+		log.Printf("DEBUG: [%s] Session ended during dial for client %s, closing connection", c.config.Name, req.ClientID)
+		return
+	}
+
+	// Check if pending connection was closed while we were dialing (e.g., disconnect received, buffer overflow)
+	select {
+	case <-pendingClient.quit:
+		conn.Close()
+		c.localConns.Delete(req.ClientID) // Ensure stale entry is removed
+		log.Printf("DEBUG: [%s] Pending connection closed during dial for client %s", c.config.Name, req.ClientID)
+		// Best-effort disconnect notification (may fail if session ended)
+		if err := c.sendControlMessage("disconnect", req.ClientID); err != nil {
+			log.Printf("DEBUG: [%s] Failed to send disconnect for client %s after pending close: %v", c.config.Name, req.ClientID, err)
+		}
+		return
+	default:
+	}
+
+	// Complete the pending connection with mutex to prevent data race with safeClose
+	pendingClient.connMu.Lock()
+	pendingClient.conn = conn
+	pendingClient.connMu.Unlock()
+
+	// Re-check if quit was closed during the conn assignment race window.
+	// If safeClose() ran while conn was nil, closeOnce consumed with nil conn,
+	// so we must close the newly assigned conn here to prevent FD leak.
+	select {
+	case <-pendingClient.quit:
+		conn.Close()
+		c.localConns.Delete(req.ClientID)
+		log.Printf("DEBUG: [%s] Connection closed during conn assignment for client %s", c.config.Name, req.ClientID)
+		return
+	default:
+	}
+
+	pendingClient.pending.Store(false)
+	pendingClient.lastActivity.Store(time.Now().Unix())
+
+	// Start reader (local -> Nexus) and writer (Nexus -> local) pumps
+	go c.copyLocalToNexus(pendingClient)
+	go c.writeToLocal(pendingClient)
+}
+
+// writeToLocal reads from the connection's write channel and writes to the local service.
+// This runs in a dedicated goroutine per connection to avoid blocking readPump.
+// Note: Cleanup (safeClose, localConns.Delete, disconnect message) is handled by copyLocalToNexus.
+func (c *Client) writeToLocal(client *clientConn) {
+	defer client.safeClose() // Trigger cleanup; copyLocalToNexus handles map deletion and disconnect
+
+	for {
+		select {
+		case <-client.quit:
+			return
+		case data := <-client.writeCh:
+			// Set write deadline to prevent indefinite blocking
+			if tc, ok := client.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+				tc.SetWriteDeadline(time.Now().Add(localWriteTimeout))
+			}
+			_, err := client.conn.Write(data)
+			if err != nil {
+				if client.hostname != "" {
+					log.Printf("ERROR: [%s] Failed to write data to local connection for ClientID %s (%s): %v", c.config.Name, client.id, client.hostname, err)
+				} else {
+					log.Printf("ERROR: [%s] Failed to write data to local connection for ClientID %s: %v", c.config.Name, client.id, err)
+				}
+				return
+			}
+		}
+	}
+}
+
 func (c *Client) handleDataMessage(payload []byte) {
 	if len(payload) < clientIDLength {
 		return
@@ -441,19 +683,27 @@ func (c *Client) handleDataMessage(payload []byte) {
 
 	var clientID uuid.UUID
 	copy(clientID[:], payload[:clientIDLength])
-	data := payload[clientIDLength:]
+
+	// Copy data to avoid race with buffer reuse in read loop
+	data := make([]byte, len(payload)-clientIDLength)
+	copy(data, payload[clientIDLength:])
 
 	val, ok := c.localConns.Load(clientID)
 	if ok {
 		if conn, ok := val.(*clientConn); ok {
 			conn.lastActivity.Store(time.Now().Unix()) // Reset activity timer
-			_, err := conn.conn.Write(data)
-			if err != nil {
-				conn.conn.Close()
-				if conn.hostname != "" {
-					log.Printf("ERROR: [%s] Failed to write data to local connection for ClientID %s (%s): %v", c.config.Name, clientID, conn.hostname, err)
-				} else {
-					log.Printf("ERROR: [%s] Failed to write data to local connection for ClientID %s: %v", c.config.Name, clientID, err)
+			// Non-blocking enqueue to write channel
+			select {
+			case conn.writeCh <- data:
+				// Successfully enqueued
+			default:
+				// Write buffer full, connection is slow - close it
+				log.Printf("WARN: [%s] Write buffer full for ClientID %s, closing connection", c.config.Name, clientID)
+				conn.safeClose()
+				c.localConns.Delete(clientID)
+				// Notify Nexus that connection is closed
+				if err := c.sendControlMessage("disconnect", clientID); err != nil {
+					log.Printf("DEBUG: [%s] Failed to send disconnect for client %s after buffer overflow: %v", c.config.Name, clientID, err)
 				}
 			}
 		}
@@ -467,7 +717,7 @@ func (c *Client) handleDataMessage(payload []byte) {
 
 func (c *Client) copyLocalToNexus(client *clientConn) {
 	defer func() {
-		client.conn.Close()
+		client.safeClose()
 		c.localConns.Delete(client.id)
 		if client.hostname != "" {
 			log.Printf("INFO: [%s] Cleaned up local connection for ClientID %s (%s)", c.config.Name, client.id, client.hostname)
@@ -701,8 +951,8 @@ func (c *Client) healthCheckPump() {
 						log.Printf("DEBUG: [%s] Failed to send ping for client %s: %v", c.config.Name, conn.id, err)
 					}
 
-					// Start a timer to check for the pong.
-					time.AfterFunc(pongTimeout, func() {
+					// Start a cancellable timer to check for the pong.
+					conn.setPongTimer(pongTimeout, func() {
 						if conn.pingSent.Load() {
 							// Pong was not received in time.
 							if conn.hostname != "" {
@@ -710,7 +960,7 @@ func (c *Client) healthCheckPump() {
 							} else {
 								log.Printf("WARN: [%s] Did not receive pong for idle client %s within %s. Closing connection.", c.config.Name, conn.id, pongTimeout)
 							}
-							conn.conn.Close() // This will trigger the full cleanup process.
+							conn.safeClose() // This will trigger the full cleanup process.
 						}
 					})
 				}

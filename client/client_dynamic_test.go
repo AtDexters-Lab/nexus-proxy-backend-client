@@ -52,6 +52,7 @@ func TestClientWithCustomConnectHandler(t *testing.T) {
 		t.Fatalf("failed to construct client: %v", err)
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.connected.Store(true) // Simulate active session
 	defer c.cancel()
 
 	msg := struct {
