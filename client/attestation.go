@@ -1,7 +1,6 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,6 +25,8 @@ const (
 	attestEnvBackend              = "NEXUS_BACKEND_NAME"
 	attestEnvHostnames            = "NEXUS_HOSTNAMES"
 	attestEnvWeight               = "NEXUS_WEIGHT"
+	attestEnvTCPPorts             = "NEXUS_TCP_PORTS"
+	attestEnvUDPRoutes            = "NEXUS_UDP_ROUTES"
 )
 
 // Token encapsulates the token value and an optional expiry.
@@ -35,11 +36,15 @@ type Token struct {
 }
 
 // TokenRequest conveys the contextual information for issuing a token.
+// Note: TCPPorts and UDPRoutes are used by CommandTokenProvider (passed as env vars)
+// but HMACTokenProvider uses its own stored config values for these fields.
 type TokenRequest struct {
 	Stage        TokenStage
 	SessionNonce string
 	BackendName  string
 	Hostnames    []string
+	TCPPorts     []int
+	UDPRoutes    []UDPRouteConfig
 	Weight       int
 }
 
@@ -135,6 +140,8 @@ func (c *CommandTokenProvider) IssueToken(ctx context.Context, req TokenRequest)
 		fmt.Sprintf("%s=%s", attestEnvBackend, req.BackendName),
 		fmt.Sprintf("%s=%s", attestEnvHostnames, strings.Join(req.Hostnames, ",")),
 		fmt.Sprintf("%s=%d", attestEnvWeight, req.Weight),
+		fmt.Sprintf("%s=%s", attestEnvTCPPorts, formatTCPPorts(req.TCPPorts)),
+		fmt.Sprintf("%s=%s", attestEnvUDPRoutes, formatUDPRoutes(req.UDPRoutes)),
 	)
 	if req.Stage != StageHandshake {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", attestEnvNonce, req.SessionNonce))
@@ -171,6 +178,35 @@ func formatEnv(extra map[string]string) []string {
 		out = append(out, fmt.Sprintf("%s=%s", k, v))
 	}
 	return out
+}
+
+// formatTCPPorts formats TCP ports as comma-separated list (e.g., "53,80,443")
+func formatTCPPorts(ports []int) string {
+	if len(ports) == 0 {
+		return ""
+	}
+	strs := make([]string, len(ports))
+	for i, p := range ports {
+		strs[i] = fmt.Sprintf("%d", p)
+	}
+	return strings.Join(strs, ",")
+}
+
+// formatUDPRoutes formats UDP routes as port:timeout pairs (e.g., "53:30,67:60")
+// If timeout is nil, just the port is included (e.g., "53,67:60")
+func formatUDPRoutes(routes []UDPRouteConfig) string {
+	if len(routes) == 0 {
+		return ""
+	}
+	strs := make([]string, len(routes))
+	for i, r := range routes {
+		if r.FlowIdleTimeoutSeconds != nil {
+			strs[i] = fmt.Sprintf("%d:%d", r.Port, *r.FlowIdleTimeoutSeconds)
+		} else {
+			strs[i] = fmt.Sprintf("%d", r.Port)
+		}
+	}
+	return strings.Join(strs, ",")
 }
 
 func parseTokenOutput(raw []byte) (Token, error) {
@@ -213,19 +249,21 @@ type HMACTokenProvider struct {
 	opts           AttestationOptions
 	backendName    string
 	hostnames      []string
+	tcpPorts       []int
+	udpRoutes      []UDPRouteConfig
 	weight         int
 	handshakeCache tokenCache
 }
 
 // NewHMACTokenProvider returns a TokenProvider that signs JWTs locally using HS256.
-func NewHMACTokenProvider(opts AttestationOptions, backendName string, hostnames []string, weight int) (*HMACTokenProvider, error) {
+func NewHMACTokenProvider(opts AttestationOptions, backendName string, hostnames []string, tcpPorts []int, udpRoutes []UDPRouteConfig, weight int) (*HMACTokenProvider, error) {
 	secret := strings.TrimSpace(opts.HMACSecret)
 	if opts.HMACSecretFile != "" {
 		data, err := os.ReadFile(opts.HMACSecretFile)
 		if err != nil {
 			return nil, fmt.Errorf("read hmac secret file: %w", err)
 		}
-		secret = strings.TrimSpace(string(bytes.TrimSpace(data)))
+		secret = strings.TrimSpace(string(data))
 	}
 	if secret == "" {
 		return nil, errors.New("hmac secret is required")
@@ -236,9 +274,27 @@ func NewHMACTokenProvider(opts AttestationOptions, backendName string, hostnames
 		opts:        opts,
 		backendName: backendName,
 		hostnames:   append([]string(nil), hostnames...),
+		tcpPorts:    append([]int(nil), tcpPorts...),
+		udpRoutes:   CopyUDPRoutes(udpRoutes),
 		weight:      weight,
 	}
 	return provider, nil
+}
+
+// CopyUDPRoutes creates a deep copy of UDPRouteConfig slice.
+func CopyUDPRoutes(in []UDPRouteConfig) []UDPRouteConfig {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]UDPRouteConfig, len(in))
+	for i, r := range in {
+		out[i] = UDPRouteConfig{Port: r.Port}
+		if r.FlowIdleTimeoutSeconds != nil {
+			timeout := *r.FlowIdleTimeoutSeconds
+			out[i].FlowIdleTimeoutSeconds = &timeout
+		}
+	}
+	return out
 }
 
 // IssueToken signs a JWT that encodes the attestation claims expected by Nexus.
@@ -257,8 +313,7 @@ func (h *HMACTokenProvider) IssueToken(ctx context.Context, req TokenRequest) (T
 	exp := now.Add(ttl)
 
 	claims := attestationClaims{
-		Hostnames: append([]string(nil), h.hostnames...),
-		Weight:    h.weight,
+		Weight: h.weight,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    "authorizer",
 			Subject:   h.backendName,
@@ -266,6 +321,28 @@ func (h *HMACTokenProvider) IssueToken(ctx context.Context, req TokenRequest) (T
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(exp),
 		},
+	}
+
+	// Only include hostnames if present (omitempty will exclude empty slice)
+	if len(h.hostnames) > 0 {
+		claims.Hostnames = append([]string(nil), h.hostnames...)
+	}
+
+	// Only include TCP ports if present
+	if len(h.tcpPorts) > 0 {
+		claims.TCPPorts = append([]int(nil), h.tcpPorts...)
+	}
+
+	// Only include UDP routes if present
+	if len(h.udpRoutes) > 0 {
+		claims.UDPRoutes = make([]udpRouteClaim, len(h.udpRoutes))
+		for i, r := range h.udpRoutes {
+			claims.UDPRoutes[i] = udpRouteClaim{Port: r.Port}
+			if r.FlowIdleTimeoutSeconds != nil {
+				timeout := *r.FlowIdleTimeoutSeconds
+				claims.UDPRoutes[i].FlowIdleTimeoutSeconds = &timeout
+			}
+		}
 	}
 
 	if req.Stage != StageHandshake {
@@ -313,14 +390,21 @@ func optionalInt(val int) *int {
 }
 
 type attestationClaims struct {
-	Hostnames                  []string `json:"hostnames"`
-	Weight                     int      `json:"weight"`
-	SessionNonce               string   `json:"session_nonce,omitempty"`
-	HandshakeMaxAgeSeconds     *int     `json:"handshake_max_age_seconds,omitempty"`
-	ReauthIntervalSeconds      *int     `json:"reauth_interval_seconds,omitempty"`
-	ReauthGraceSeconds         *int     `json:"reauth_grace_seconds,omitempty"`
-	MaintenanceGraceCapSeconds *int     `json:"maintenance_grace_cap_seconds,omitempty"`
-	AuthorizerStatusURI        string   `json:"authorizer_status_uri,omitempty"`
-	PolicyVersion              string   `json:"policy_version,omitempty"`
+	Hostnames                  []string        `json:"hostnames,omitempty"`
+	TCPPorts                   []int           `json:"tcp_ports,omitempty"`
+	UDPRoutes                  []udpRouteClaim `json:"udp_routes,omitempty"`
+	Weight                     int             `json:"weight"`
+	SessionNonce               string          `json:"session_nonce,omitempty"`
+	HandshakeMaxAgeSeconds     *int            `json:"handshake_max_age_seconds,omitempty"`
+	ReauthIntervalSeconds      *int            `json:"reauth_interval_seconds,omitempty"`
+	ReauthGraceSeconds         *int            `json:"reauth_grace_seconds,omitempty"`
+	MaintenanceGraceCapSeconds *int            `json:"maintenance_grace_cap_seconds,omitempty"`
+	AuthorizerStatusURI        string          `json:"authorizer_status_uri,omitempty"`
+	PolicyVersion              string          `json:"policy_version,omitempty"`
 	jwt.RegisteredClaims
+}
+
+type udpRouteClaim struct {
+	Port                   int  `json:"port"`
+	FlowIdleTimeoutSeconds *int `json:"flow_idle_timeout_seconds,omitempty"`
 }

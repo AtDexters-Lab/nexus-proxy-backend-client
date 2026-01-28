@@ -237,3 +237,166 @@ func TestSendControlMessageSkipsMarshalErrors(t *testing.T) {
 	default:
 	}
 }
+
+func TestHandleControlMessageWithTransport(t *testing.T) {
+	cfg := ClientBackendConfig{
+		Name:         "test-backend",
+		Hostnames:    []string{"example.com"},
+		NexusAddress: "ws://example.com",
+		Weight:       1,
+		PortMappings: map[int]PortMapping{
+			53: {Default: "127.0.0.1:53"},
+		},
+	}
+
+	var capturedReq ConnectRequest
+	c, err := New(cfg,
+		WithTokenProvider(constantProvider{value: "token"}),
+		WithConnectHandler(func(ctx context.Context, req ConnectRequest) (net.Conn, error) {
+			capturedReq = req
+			return nil, ErrNoRoute
+		}),
+	)
+	if err != nil {
+		t.Fatalf("failed to construct client: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.ctx = ctx
+	c.cancel = cancel
+	defer cancel()
+
+	// Test with UDP transport
+	clientID := uuid.New()
+	payload := fmt.Sprintf(`{"event":"connect","client_id":"%s","conn_port":53,"transport":"udp","hostname":"udp:53"}`, clientID)
+	c.handleControlMessage([]byte(payload))
+
+	// Wait a bit for the goroutine to process
+	time.Sleep(50 * time.Millisecond)
+
+	if capturedReq.Transport != TransportUDP {
+		t.Fatalf("expected transport UDP, got %s", capturedReq.Transport)
+	}
+	if capturedReq.Hostname != "udp:53" {
+		t.Fatalf("expected hostname 'udp:53', got %s", capturedReq.Hostname)
+	}
+}
+
+func TestHandleControlMessageDefaultsToTCP(t *testing.T) {
+	cfg := ClientBackendConfig{
+		Name:         "test-backend",
+		Hostnames:    []string{"example.com"},
+		NexusAddress: "ws://example.com",
+		Weight:       1,
+		PortMappings: map[int]PortMapping{
+			80: {Default: "127.0.0.1:80"},
+		},
+	}
+
+	var capturedReq ConnectRequest
+	c, err := New(cfg,
+		WithTokenProvider(constantProvider{value: "token"}),
+		WithConnectHandler(func(ctx context.Context, req ConnectRequest) (net.Conn, error) {
+			capturedReq = req
+			return nil, ErrNoRoute
+		}),
+	)
+	if err != nil {
+		t.Fatalf("failed to construct client: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.ctx = ctx
+	c.cancel = cancel
+	defer cancel()
+
+	// Test without transport field (should default to TCP)
+	clientID := uuid.New()
+	payload := fmt.Sprintf(`{"event":"connect","client_id":"%s","conn_port":80,"hostname":"example.com"}`, clientID)
+	c.handleControlMessage([]byte(payload))
+
+	// Wait a bit for the goroutine to process
+	time.Sleep(50 * time.Millisecond)
+
+	if capturedReq.Transport != TransportTCP {
+		t.Fatalf("expected transport TCP (default), got %s", capturedReq.Transport)
+	}
+}
+
+func TestConfigBasedConnectHandlerUsesTransport(t *testing.T) {
+	cfg := ClientBackendConfig{
+		Name:         "test-backend",
+		Hostnames:    []string{"example.com"},
+		NexusAddress: "ws://example.com",
+		Weight:       1,
+		PortMappings: map[int]PortMapping{
+			53: {Default: "127.0.0.1:53"},
+		},
+	}
+
+	c, err := New(cfg, WithTokenProvider(constantProvider{value: "token"}))
+	if err != nil {
+		t.Fatalf("failed to construct client: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.ctx = ctx
+	c.cancel = cancel
+	defer cancel()
+
+	handler := c.configBasedConnectHandler()
+
+	// Test UDP dial (will fail to connect but we can verify no panic)
+	req := ConnectRequest{
+		BackendName: "test-backend",
+		ClientID:    uuid.New(),
+		Hostname:    "udp:53",
+		Port:        53,
+		Transport:   TransportUDP,
+	}
+
+	// The dial will fail because nothing is listening, but it should attempt UDP
+	conn, err := handler(ctx, req)
+	if conn != nil {
+		conn.Close()
+	}
+	// We just verify no panic occurred; error is expected since nothing is listening
+	_ = err
+}
+
+func TestHandleControlMessageWithUnrecognizedTransport(t *testing.T) {
+	cfg := ClientBackendConfig{
+		Name:         "test-backend",
+		Hostnames:    []string{"example.com"},
+		NexusAddress: "ws://example.com",
+		Weight:       1,
+		PortMappings: map[int]PortMapping{
+			80: {Default: "127.0.0.1:80"},
+		},
+	}
+
+	var capturedReq ConnectRequest
+	c, err := New(cfg,
+		WithTokenProvider(constantProvider{value: "token"}),
+		WithConnectHandler(func(ctx context.Context, req ConnectRequest) (net.Conn, error) {
+			capturedReq = req
+			return nil, ErrNoRoute
+		}),
+	)
+	if err != nil {
+		t.Fatalf("failed to construct client: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.ctx = ctx
+	c.cancel = cancel
+	defer cancel()
+
+	// Test with unrecognized transport - should default to TCP
+	clientID := uuid.New()
+	payload := fmt.Sprintf(`{"event":"connect","client_id":"%s","conn_port":80,"transport":"invalid_transport","hostname":"example.com"}`, clientID)
+	c.handleControlMessage([]byte(payload))
+
+	// Wait for the goroutine to process
+	time.Sleep(50 * time.Millisecond)
+
+	if capturedReq.Transport != TransportTCP {
+		t.Fatalf("expected unrecognized transport to default to TCP, got %s", capturedReq.Transport)
+	}
+}

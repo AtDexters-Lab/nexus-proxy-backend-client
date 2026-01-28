@@ -97,17 +97,17 @@ type challengeMessage struct {
 // conn may be nil while dial is in progress (pending state).
 type clientConn struct {
 	id           uuid.UUID
-	connMu       sync.Mutex  // Protects conn field during assignment/close race window
-	conn         net.Conn    // nil while dial is pending; protected by connMu during mutation
+	connMu       sync.Mutex // Protects conn field during assignment/close race window
+	conn         net.Conn   // nil while dial is pending; protected by connMu during mutation
 	hostname     string
 	lastActivity atomic.Int64 // Unix timestamp of the last activity.
 	pingSent     atomic.Bool  // True if an inactivity ping has been sent.
 	pending      atomic.Bool  // True while dial is in progress
 	quit         chan struct{}
-	writeCh      chan []byte  // Buffered channel for non-blocking writes to local conn
-	closeOnce    sync.Once    // Ensures connection is closed only once
-	pongTimer    *time.Timer  // Timer for pong timeout, can be cancelled
-	pongTimerMu  sync.Mutex   // Protects pongTimer access
+	writeCh      chan []byte // Buffered channel for non-blocking writes to local conn
+	closeOnce    sync.Once   // Ensures connection is closed only once
+	pongTimer    *time.Timer // Timer for pong timeout, can be cancelled
+	pongTimerMu  sync.Mutex  // Protects pongTimer access
 }
 
 const (
@@ -159,6 +159,8 @@ func (cc *clientConn) setPongTimer(d time.Duration, f func()) {
 type ClientBackendConfig struct {
 	Name         string
 	Hostnames    []string
+	TCPPorts     []int
+	UDPRoutes    []UDPRouteConfig
 	NexusAddress string
 	Weight       int
 	Attestation  AttestationOptions
@@ -233,7 +235,7 @@ func buildDefaultProvider(cfg ClientBackendConfig) (TokenProvider, error) {
 		return NewCommandTokenProvider(opts)
 	}
 	if strings.TrimSpace(opts.HMACSecret) != "" || strings.TrimSpace(opts.HMACSecretFile) != "" {
-		return NewHMACTokenProvider(opts, cfg.Name, cfg.Hostnames, cfg.Weight)
+		return NewHMACTokenProvider(opts, cfg.Name, cfg.Hostnames, cfg.TCPPorts, cfg.UDPRoutes, cfg.Weight)
 	}
 	return nil, nil
 }
@@ -339,6 +341,8 @@ func (c *Client) issueToken(ctx context.Context, stage TokenStage, nonce string)
 		SessionNonce: nonce,
 		BackendName:  c.config.Name,
 		Hostnames:    append([]string(nil), c.config.Hostnames...),
+		TCPPorts:     append([]int(nil), c.config.TCPPorts...),
+		UDPRoutes:    CopyUDPRoutes(c.config.UDPRoutes),
 		Weight:       c.config.Weight,
 	}
 
@@ -464,12 +468,13 @@ func (c *Client) readPump() {
 
 func (c *Client) handleControlMessage(payload []byte) {
 	var msg struct {
-		Event    string    `json:"event"`
-		ClientID uuid.UUID `json:"client_id"`
-		ConnPort int       `json:"conn_port"` // Port on which the client is connecting
-		ClientIP string    `json:"client_ip"` // Optional field for future use
-		Hostname string    `json:"hostname"`
-		IsTLS    bool      `json:"is_tls"` // Indicates whether the original client spoke TLS.
+		Event     string    `json:"event"`
+		ClientID  uuid.UUID `json:"client_id"`
+		ConnPort  int       `json:"conn_port"` // Port on which the client is connecting
+		ClientIP  string    `json:"client_ip"` // Optional field for future use
+		Transport Transport `json:"transport"` // "tcp" or "udp"
+		Hostname  string    `json:"hostname"`  // May contain route key like "tcp:53" or "udp:53"
+		IsTLS     bool      `json:"is_tls"`    // Indicates whether the original client spoke TLS.
 	}
 	if err := json.Unmarshal(payload, &msg); err != nil {
 		log.Printf("WARN: [%s] Failed to unmarshal control message: %v", c.config.Name, err)
@@ -478,11 +483,20 @@ func (c *Client) handleControlMessage(payload []byte) {
 
 	switch msg.Event {
 	case "connect":
+		// Default to TCP for backward compatibility with older servers
+		transport := msg.Transport
+		if transport == "" {
+			transport = TransportTCP
+		} else if transport != TransportTCP && transport != TransportUDP {
+			log.Printf("WARN: [%s] Unrecognized transport '%s' for ClientID %s, defaulting to TCP", c.config.Name, transport, msg.ClientID)
+			transport = TransportTCP
+		}
+
 		normalizedHost := normalizeHostname(msg.Hostname)
 		if normalizedHost == "" {
 			normalizedHost = msg.Hostname
 		}
-		log.Printf("INFO: [%s] Received 'connect' for ClientID %s on port %d (hostname: %s, tls:%v).", c.config.Name, msg.ClientID, msg.ConnPort, normalizedHost, msg.IsTLS)
+		log.Printf("INFO: [%s] Received 'connect' for ClientID %s on port %d (hostname: %s, transport: %s, tls:%v).", c.config.Name, msg.ClientID, msg.ConnPort, normalizedHost, transport, msg.IsTLS)
 
 		req := ConnectRequest{
 			BackendName:      c.config.Name,
@@ -492,6 +506,7 @@ func (c *Client) handleControlMessage(payload []byte) {
 			Port:             msg.ConnPort,
 			ClientIP:         msg.ClientIP,
 			IsTLS:            msg.IsTLS,
+			Transport:        transport,
 		}
 
 		// Create pending connection immediately to buffer early data while dial is in progress
@@ -570,8 +585,15 @@ func (c *Client) configBasedConnectHandler() ConnectHandler {
 		if !ok {
 			return nil, ErrNoRoute
 		}
+
+		// Use transport from request (default TCP)
+		network := "tcp"
+		if req.Transport == TransportUDP {
+			network = "udp"
+		}
+
 		var d net.Dialer
-		return d.DialContext(ctx, "tcp", localAddr)
+		return d.DialContext(ctx, network, localAddr)
 	}
 }
 

@@ -22,6 +22,7 @@ type ConnectRequest struct {
 	Port             int
 	ClientIP         string
 	IsTLS            bool
+	Transport        Transport // "tcp" or "udp" (defaults to "tcp" if empty)
 }
 
 // ConnectHandler is invoked whenever the proxy asks us to establish a new

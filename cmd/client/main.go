@@ -42,6 +42,8 @@ func main() {
 			}(client.ClientBackendConfig{
 				Name:         backendCfg.Name,
 				Hostnames:    append([]string(nil), backendCfg.Hostnames...),
+				TCPPorts:     append([]int(nil), backendCfg.TCPPorts...),
+				UDPRoutes:    client.CopyUDPRoutes(backendCfg.UDPRoutes),
 				NexusAddress: nexusAddr,
 				Weight:       backendCfg.Weight,
 				Attestation: client.AttestationOptions{

@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"fmt"
+	"log"
 	"os"
 	"sort"
 	"strings"
@@ -10,6 +11,26 @@ import (
 	"golang.org/x/net/idna"
 	"gopkg.in/yaml.v3"
 )
+
+// Transport represents the network protocol for a connection.
+// Valid values are "tcp" and "udp". The server sends this field in connect
+// messages to indicate whether the client should dial a TCP or UDP connection
+// to the local backend service.
+type Transport string
+
+const (
+	TransportTCP Transport = "tcp"
+	TransportUDP Transport = "udp"
+)
+
+// UDPRouteConfig defines a UDP port claim with optional flow idle timeout.
+// FlowIdleTimeoutSeconds specifies how long the server waits before cleaning up
+// an idle UDP flow. If nil, the server uses its default timeout. If set to 0,
+// behavior depends on server implementation (typically uses default or no timeout).
+type UDPRouteConfig struct {
+	Port                   int  `yaml:"port"`
+	FlowIdleTimeoutSeconds *int `yaml:"flowIdleTimeoutSeconds,omitempty"`
+}
 
 type Config struct {
 	Backends []BackendConfig `yaml:"backends"`
@@ -42,6 +63,8 @@ type BackendConfig struct {
 	Name           string              `yaml:"name"`
 	Hostname       string              `yaml:"hostname"`
 	Hostnames      []string            `yaml:"hostnames"`
+	TCPPorts       []int               `yaml:"tcpPorts,omitempty"`
+	UDPRoutes      []UDPRouteConfig    `yaml:"udpRoutes,omitempty"`
 	NexusAddresses []string            `yaml:"nexusAddresses"`
 	Weight         int                 `yaml:"weight"`
 	Attestation    AttestationConfig   `yaml:"attestation"`
@@ -192,12 +215,53 @@ func LoadConfig(path string) (*Config, error) {
 				b.Hostnames = []string{b.Hostname}
 			}
 		}
-		if len(b.Hostnames) == 0 {
-			return nil, fmt.Errorf("backend '%s': at least one hostname is required", b.Name)
+
+		// Validate and deduplicate TCPPorts (preserving original order)
+		if len(b.TCPPorts) > 0 {
+			seen := make(map[int]struct{})
+			deduped := make([]int, 0, len(b.TCPPorts))
+			for _, port := range b.TCPPorts {
+				if port < 1 || port > 65535 {
+					return nil, fmt.Errorf("backend '%s': invalid TCP port %d (must be 1-65535)", b.Name, port)
+				}
+				if _, exists := seen[port]; exists {
+					continue
+				}
+				seen[port] = struct{}{}
+				deduped = append(deduped, port)
+			}
+			b.TCPPorts = deduped
 		}
+
+		// Validate UDPRoutes
+		seenUDPPorts := make(map[int]struct{})
+		for j, route := range b.UDPRoutes {
+			if route.Port < 1 || route.Port > 65535 {
+				return nil, fmt.Errorf("backend '%s': invalid UDP port %d (must be 1-65535)", b.Name, route.Port)
+			}
+			if route.FlowIdleTimeoutSeconds != nil && *route.FlowIdleTimeoutSeconds < 0 {
+				return nil, fmt.Errorf("backend '%s': udpRoutes[%d].flowIdleTimeoutSeconds cannot be negative", b.Name, j)
+			}
+			if _, exists := seenUDPPorts[route.Port]; exists {
+				return nil, fmt.Errorf("backend '%s': duplicate UDP port %d in udpRoutes", b.Name, route.Port)
+			}
+			seenUDPPorts[route.Port] = struct{}{}
+		}
+
+		hasPortClaims := len(b.TCPPorts) > 0 || len(b.UDPRoutes) > 0
+
+		// Allow backends without hostnames if they have port claims
+		if len(b.Hostnames) == 0 && !hasPortClaims {
+			return nil, fmt.Errorf("backend '%s': at least one hostname, tcpPort, or udpRoute is required", b.Name)
+		}
+
 		normalized := make([]string, 0, len(b.Hostnames))
 		seen := make(map[string]struct{}, len(b.Hostnames))
 		for _, rawHost := range b.Hostnames {
+			// Reject hostnames that look like route keys
+			if strings.HasPrefix(rawHost, "tcp:") || strings.HasPrefix(rawHost, "udp:") {
+				return nil, fmt.Errorf("backend '%s': invalid hostname '%s' (cannot use route key format)", b.Name, rawHost)
+			}
 			host := normalizeHostname(rawHost)
 			if host == "" {
 				return nil, fmt.Errorf("backend '%s': invalid hostname '%s'", b.Name, rawHost)
@@ -209,7 +273,9 @@ func LoadConfig(path string) (*Config, error) {
 			normalized = append(normalized, host)
 		}
 		b.Hostnames = normalized
-		b.Hostname = normalized[0]
+		if len(normalized) > 0 {
+			b.Hostname = normalized[0]
+		}
 		if len(b.NexusAddresses) == 0 {
 			return nil, fmt.Errorf("backend '%s': nexusAddresses is required", b.Name)
 		}
@@ -263,6 +329,18 @@ func LoadConfig(path string) (*Config, error) {
 				return nil, fmt.Errorf("backend '%s': port %d: port mapping must specify a default or host overrides", b.Name, port)
 			}
 			b.PortMappings[port] = mapping
+		}
+
+		// Warn if claimed ports have no matching portMappings entry
+		for _, port := range b.TCPPorts {
+			if _, ok := b.PortMappings[port]; !ok {
+				log.Printf("WARN: backend '%s': tcpPort %d has no matching portMapping entry", b.Name, port)
+			}
+		}
+		for _, route := range b.UDPRoutes {
+			if _, ok := b.PortMappings[route.Port]; !ok {
+				log.Printf("WARN: backend '%s': udpRoute port %d has no matching portMapping entry", b.Name, route.Port)
+			}
 		}
 		if b.HealthChecks.Enabled {
 			if b.HealthChecks.InactivityTimeout <= 0 {
