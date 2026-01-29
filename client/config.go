@@ -42,6 +42,17 @@ type HealthCheckConfig struct {
 	PongTimeout       int  `yaml:"pongTimeout"`
 }
 
+// FlowControlConfig configures per-connection flow control parameters.
+// These control when pause/resume messages are sent to Nexus.
+type FlowControlConfig struct {
+	// HighWaterMark is the buffer level at which we send pause_stream (default: 48)
+	HighWaterMark int `yaml:"highWaterMark"`
+	// LowWaterMark is the buffer level at which we send resume_stream (default: 16)
+	LowWaterMark int `yaml:"lowWaterMark"`
+	// MaxBuffer is the hard limit on buffered messages before closing connection (default: 64)
+	MaxBuffer int `yaml:"maxBuffer"`
+}
+
 type AttestationConfig struct {
 	Command                    string            `yaml:"command"`
 	Args                       []string          `yaml:"args"`
@@ -70,6 +81,7 @@ type BackendConfig struct {
 	Attestation    AttestationConfig   `yaml:"attestation"`
 	PortMappings   map[int]PortMapping `yaml:"portMappings"`
 	HealthChecks   HealthCheckConfig   `yaml:"healthChecks"`
+	FlowControl    FlowControlConfig   `yaml:"flowControl"`
 }
 
 type wildcardRoute struct {
@@ -349,6 +361,25 @@ func LoadConfig(path string) (*Config, error) {
 			if b.HealthChecks.PongTimeout <= 0 {
 				b.HealthChecks.PongTimeout = 5 // Default
 			}
+		}
+		// Flow control defaults
+		if b.FlowControl.HighWaterMark <= 0 {
+			b.FlowControl.HighWaterMark = 48
+		}
+		if b.FlowControl.LowWaterMark <= 0 {
+			b.FlowControl.LowWaterMark = 16
+		}
+		if b.FlowControl.MaxBuffer <= 0 {
+			b.FlowControl.MaxBuffer = 64
+		}
+		// Validate flow control thresholds
+		if b.FlowControl.LowWaterMark >= b.FlowControl.HighWaterMark {
+			return nil, fmt.Errorf("backend '%s': flowControl.lowWaterMark (%d) must be less than highWaterMark (%d)",
+				b.Name, b.FlowControl.LowWaterMark, b.FlowControl.HighWaterMark)
+		}
+		if b.FlowControl.HighWaterMark >= b.FlowControl.MaxBuffer {
+			return nil, fmt.Errorf("backend '%s': flowControl.highWaterMark (%d) must be less than maxBuffer (%d)",
+				b.Name, b.FlowControl.HighWaterMark, b.FlowControl.MaxBuffer)
 		}
 	}
 

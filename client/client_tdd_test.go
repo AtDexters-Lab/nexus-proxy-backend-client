@@ -129,7 +129,7 @@ func TestWritePumpDoesNotReplayStaleMessages(t *testing.T) {
 
 	serverConn1.Close()
 	clientConn1.Close()
-	c.send <- outboundMessage{messageType: websocket.BinaryMessage, payload: []byte("trigger")}
+	c.controlSend <- outboundMessage{messageType: websocket.BinaryMessage, payload: []byte("trigger")}
 
 	select {
 	case <-done1:
@@ -186,7 +186,7 @@ func TestWritePumpDoesNotReplayStaleMessages(t *testing.T) {
 func TestHandleTextMessageRespondsToReauthChallenge(t *testing.T) {
 	c := newTestClient(t)
 	c.connected.Store(true)
-	c.send = make(chan outboundMessage, 1)
+	c.controlSend = make(chan outboundMessage, 1)
 
 	msg := []byte(`{"type":"reauth_challenge","nonce":"abc123"}`)
 
@@ -195,7 +195,7 @@ func TestHandleTextMessageRespondsToReauthChallenge(t *testing.T) {
 	}
 
 	select {
-	case outbound := <-c.send:
+	case outbound := <-c.controlSend:
 		if outbound.messageType != websocket.TextMessage {
 			t.Fatalf("expected text message, got type %d", outbound.messageType)
 		}
@@ -220,7 +220,7 @@ func TestSendControlMessageSkipsMarshalErrors(t *testing.T) {
 		return nil, fmt.Errorf(wantErr)
 	}
 
-	c.send = make(chan outboundMessage, 1)
+	c.controlSend = make(chan outboundMessage, 1)
 
 	c.connected.Store(true)
 	err := c.sendControlMessage("ping_client", uuid.New())
@@ -232,7 +232,7 @@ func TestSendControlMessageSkipsMarshalErrors(t *testing.T) {
 	}
 
 	select {
-	case msg := <-c.send:
+	case msg := <-c.controlSend:
 		t.Fatalf("expected no message enqueued, got %x", msg)
 	default:
 	}

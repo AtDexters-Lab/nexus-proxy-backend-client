@@ -69,3 +69,13 @@ func WithTokenProvider(provider TokenProvider) Option {
 		c.tokenProvider = provider
 	}
 }
+
+// WithEventHandler registers a callback for client lifecycle events.
+// Events are delivered asynchronously in order via a dedicated goroutine.
+// The handler should not block for extended periods as this can cause
+// events to be dropped. Passing nil disables event delivery.
+func WithEventHandler(handler EventHandler) Option {
+	return func(c *Client) {
+		c.eventHandler = handler
+	}
+}

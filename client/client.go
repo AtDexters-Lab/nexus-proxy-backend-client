@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -58,9 +59,219 @@ const (
 	pongWait         = 10 * time.Second
 	handshakeTimeout = 15 * time.Second
 	maxMessageSize   = 32*1024 + 17
+
+	enqueueTimeout         = 5 * time.Second
+	controlQueueSize       = 64
+	connectionDrainTimeout = 5 * time.Second
+
+	// Robustness stats keys (for observability, though we don't have metrics struct yet)
+	// We'll log them for now.
+	maxPermanentFailures = 5
+)
+
+type ErrorCategory int
+
+const (
+	ErrorTransient ErrorCategory = iota // Retry with backoff
+	ErrorPermanent                      // Don't retry, surface to user
+	ErrorRateLimit                      // Retry with longer backoff
+)
+
+type CategorizedError struct {
+	Err      error
+	Category ErrorCategory
+	Reason   string // Machine-readable reason code
+}
+
+func categorizeError(err error) CategorizedError {
+	if err == nil {
+		return CategorizedError{nil, ErrorTransient, "none"}
+	}
+	// unwrapped checks
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return CategorizedError{err, ErrorTransient, "timeout"}
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return CategorizedError{err, ErrorTransient, "connection_refused"}
+	}
+
+	errMsg := strings.ToLower(err.Error())
+
+	if strings.Contains(errMsg, "rate limit") {
+		return CategorizedError{err, ErrorRateLimit, "rate_limited"}
+	}
+
+	// Auth failures are permanent - retrying won't help without credential changes
+	if strings.Contains(errMsg, "unauthorized") ||
+		strings.Contains(errMsg, "invalid token") ||
+		strings.Contains(errMsg, "invalid credential") ||
+		strings.Contains(errMsg, "authentication failed") ||
+		strings.Contains(errMsg, "forbidden") ||
+		strings.Contains(errMsg, "401") ||
+		strings.Contains(errMsg, "403") {
+		return CategorizedError{err, ErrorPermanent, "auth_failed"}
+	}
+
+	return CategorizedError{err, ErrorTransient, "unknown"}
+}
+
+type ConnState uint32
+
+const (
+	ConnStatePending  ConnState = iota // Dial in progress
+	ConnStateActive                    // Connected, relaying data
+	ConnStateDraining                  // Graceful shutdown, no new data
+	ConnStateClosed                    // Terminal state
 )
 
 var errSessionInactive = errors.New("client session inactive")
+
+// ============================================================================
+// Phase 4: Observability - Stats and Events
+// ============================================================================
+
+// EventType represents the type of client event.
+type EventType int
+
+const (
+	EventConnected EventType = iota
+	EventDisconnected
+	EventConnectionOpened
+	EventConnectionClosed
+	EventPaused
+	EventResumed
+	EventError
+	EventReauthStarted
+	EventReauthCompleted
+)
+
+func (e EventType) String() string {
+	switch e {
+	case EventConnected:
+		return "connected"
+	case EventDisconnected:
+		return "disconnected"
+	case EventConnectionOpened:
+		return "connection_opened"
+	case EventConnectionClosed:
+		return "connection_closed"
+	case EventPaused:
+		return "paused"
+	case EventResumed:
+		return "resumed"
+	case EventError:
+		return "error"
+	case EventReauthStarted:
+		return "reauth_started"
+	case EventReauthCompleted:
+		return "reauth_completed"
+	default:
+		return "unknown"
+	}
+}
+
+// Event represents a client lifecycle event.
+type Event struct {
+	Type      EventType
+	Timestamp time.Time
+
+	// Connection context (if applicable)
+	ClientID string
+	Hostname string
+
+	// Error context (if applicable)
+	Error  error
+	Reason string
+}
+
+// EventHandler is a callback function for client events.
+type EventHandler func(Event)
+
+// Stats provides a snapshot of client statistics.
+type Stats struct {
+	// Connection metrics
+	ActiveConnections  int64
+	TotalConnections   int64
+	PendingConnections int64
+
+	// Data transfer
+	BytesSentTotal        int64
+	BytesReceivedTotal    int64
+	MessagesSentTotal     int64
+	MessagesReceivedTotal int64
+
+	// Queue metrics
+	ControlQueueDepth int
+	DataQueueDepth    int // Number of connections with pending data
+
+	// Error metrics
+	DroppedConnections int64
+	TransientErrors    int64
+	PermanentErrors    int64
+	RateLimitHits      int64
+	EnqueueTimeouts    int64
+
+	// Flow control
+	PausedConnections int64
+	PauseViolations   int64
+
+	// Event metrics
+	DroppedEvents int64
+
+	// UDP metrics
+	UDPDroppedPackets int64
+
+	// Session metrics
+	SessionUptime   time.Duration
+	LastUpdated     time.Time
+	ReconnectCount  int64
+	LastConnectedAt time.Time
+
+	// Per-connection stats (optional, can be expensive)
+	ConnectionStats map[string]ConnectionStats
+}
+
+// ConnectionStats provides per-connection statistics.
+type ConnectionStats struct {
+	ClientID     string
+	Hostname     string
+	State        ConnState
+	BytesIn      int64
+	BytesOut     int64
+	BufferLevel  int
+	Paused       bool
+	ConnectedAt  time.Time
+	LastActivity time.Time
+	IsUDP        bool
+}
+
+// internalStats holds atomic counters for thread-safe stats tracking.
+type internalStats struct {
+	activeConns       atomic.Int64
+	totalConns        atomic.Int64
+	pendingConns      atomic.Int64
+	bytesSent         atomic.Int64
+	bytesRecv         atomic.Int64
+	msgsSent          atomic.Int64
+	msgsRecv          atomic.Int64
+	droppedConns      atomic.Int64
+	transientErrors   atomic.Int64
+	permanentErrors   atomic.Int64
+	rateLimitHits     atomic.Int64
+	enqueueTimeouts   atomic.Int64
+	pausedConns       atomic.Int64
+	pauseViolations   atomic.Int64
+	droppedEvents     atomic.Int64
+	udpDroppedPackets atomic.Int64
+	reconnectCount    atomic.Int64
+	sessionStart      atomic.Int64 // Unix timestamp
+	lastConnected     atomic.Int64 // Unix timestamp
+}
+
+const (
+	eventBufferSize = 256
+	statsCacheTTL   = 1 * time.Second
+)
 
 // backoffDelay calculates the reconnection delay with exponential backoff and jitter.
 // The delay doubles with each retry up to maxReconnectDelay, with ±25% jitter.
@@ -97,17 +308,32 @@ type challengeMessage struct {
 // conn may be nil while dial is in progress (pending state).
 type clientConn struct {
 	id           uuid.UUID
-	connMu       sync.Mutex // Protects conn field during assignment/close race window
-	conn         net.Conn   // nil while dial is pending; protected by connMu during mutation
+	state        atomic.Uint32 // ConnState
+	connMu       sync.Mutex    // Protects conn field during assignment/close race window
+	conn         net.Conn      // nil while dial is pending; protected by connMu during mutation
 	hostname     string
 	lastActivity atomic.Int64 // Unix timestamp of the last activity.
 	pingSent     atomic.Bool  // True if an inactivity ping has been sent.
-	pending      atomic.Bool  // True while dial is in progress
-	quit         chan struct{}
-	writeCh      chan []byte // Buffered channel for non-blocking writes to local conn
-	closeOnce    sync.Once   // Ensures connection is closed only once
-	pongTimer    *time.Timer // Timer for pong timeout, can be cancelled
-	pongTimerMu  sync.Mutex  // Protects pongTimer access
+	// pending      atomic.Bool  // Removed: replaced by state machine (ConnStatePending)
+	quit    chan struct{}
+	writeCh chan []byte // Buffered channel for non-blocking writes to local conn
+	// Flow control
+	flow flowControl
+
+	// Signaling state for fair queuing
+	signaled atomic.Bool
+
+	isUDP          bool
+	droppedPackets atomic.Int64 // UDP only: packets dropped due to slow local service
+
+	closeOnce   sync.Once   // Ensures connection is closed only once
+	pongTimer   *time.Timer // Timer for pong timeout, can be cancelled
+	pongTimerMu sync.Mutex  // Protects pongTimer access
+}
+
+// Atomic state transitions with validation
+func (c *clientConn) transition(from, to ConnState) bool {
+	return c.state.CompareAndSwap(uint32(from), uint32(to))
 }
 
 const (
@@ -156,6 +382,28 @@ func (cc *clientConn) setPongTimer(d time.Duration, f func()) {
 	cc.pongTimer = time.AfterFunc(d, f)
 }
 
+type flowControl struct {
+	// Buffer configuration
+	lowWaterMark  int // Resume threshold (e.g., 16)
+	highWaterMark int // Pause threshold (e.g., 48)
+	maxBuffer     int // Hard limit (e.g., 64)
+
+	// State
+	paused atomic.Bool
+	level  atomic.Int32
+}
+
+// drainConnection starts a timer to force close the connection if it doesn't drain in time.
+// It is called when transitioning to ConnStateDraining.
+func (c *Client) drainConnection(conn *clientConn) {
+	time.AfterFunc(connectionDrainTimeout, func() {
+		if conn.state.Load() == uint32(ConnStateDraining) {
+			log.Printf("WARN: [%s] Drain timeout for ClientID %s, forcing close", c.config.Name, conn.id)
+			c.transitionToClosed(conn, DisconnectTimeout)
+		}
+	})
+}
+
 type ClientBackendConfig struct {
 	Name         string
 	Hostnames    []string
@@ -166,16 +414,23 @@ type ClientBackendConfig struct {
 	Attestation  AttestationOptions
 	PortMappings map[int]PortMapping
 	HealthChecks HealthCheckConfig
+	FlowControl  FlowControlConfig
 }
 
 // Client manages the full lifecycle for one configured backend service.
 type Client struct {
-	config              ClientBackendConfig
-	ws                  *websocket.Conn
-	wsMu                sync.Mutex
-	localConns          sync.Map
-	send                chan outboundMessage
+	config      ClientBackendConfig
+	ws          *websocket.Conn
+	wsMu        sync.Mutex
+	localConns  sync.Map
+	controlSend chan outboundMessage
+	// Per-connection outbound queues
+	// Key: clientID, Value: chan outboundMessage
+	connQueues sync.Map
+	// Notifies writePump that a queue has data
+	dataReady           chan uuid.UUID
 	connected           atomic.Bool
+	shuttingDown        atomic.Bool  // Flag for graceful shutdown
 	sessionDone         atomic.Value // stores chan struct{}
 	ctx                 context.Context
 	cancel              context.CancelFunc
@@ -184,6 +439,16 @@ type Client struct {
 	connectHandler      ConnectHandler
 	tokenProvider       TokenProvider
 	staticTokenProvider TokenProvider
+
+	// Phase 4: Observability
+	stats        internalStats
+	eventHandler EventHandler
+	eventCh      chan Event // Buffered channel for ordered event delivery
+
+	// Stats cache for rate-limiting expensive operations
+	statsCacheMu   sync.RWMutex
+	statsCache     Stats
+	statsCacheTime time.Time
 }
 
 // New creates a new Client instance for a specific backend configuration.
@@ -192,14 +457,27 @@ func New(cfg ClientBackendConfig, opts ...Option) (*Client, error) {
 		cfg.Weight = 1
 	}
 
+	// Set flow control defaults if not configured
+	if cfg.FlowControl.HighWaterMark <= 0 {
+		cfg.FlowControl.HighWaterMark = 48
+	}
+	if cfg.FlowControl.LowWaterMark <= 0 {
+		cfg.FlowControl.LowWaterMark = 16
+	}
+	if cfg.FlowControl.MaxBuffer <= 0 {
+		cfg.FlowControl.MaxBuffer = 64
+	}
+
 	defaultProvider, err := buildDefaultProvider(cfg)
 	if err != nil {
 		return nil, err
 	}
 
 	c := &Client{
-		config: cfg,
-		send:   make(chan outboundMessage, 256), // Buffered channel to handle outgoing messages
+		config:      cfg,
+		controlSend: make(chan outboundMessage, controlQueueSize),
+		dataReady:   make(chan uuid.UUID, 256), // Buffer: 256
+		eventCh:     make(chan Event, eventBufferSize),
 	}
 	c.sessionDone.Store((chan struct{})(nil))
 
@@ -240,12 +518,161 @@ func buildDefaultProvider(cfg ClientBackendConfig) (TokenProvider, error) {
 	return nil, nil
 }
 
+// ============================================================================
+// Observability API
+// ============================================================================
+
+// Stats returns a snapshot of current client statistics.
+// This is a lightweight operation that reads atomic counters.
+func (c *Client) Stats() Stats {
+	var dataQueueDepth int
+	c.connQueues.Range(func(key, value interface{}) bool {
+		if ch, ok := value.(chan outboundMessage); ok {
+			if len(ch) > 0 {
+				dataQueueDepth++
+			}
+		}
+		return true
+	})
+
+	sessionStart := c.stats.sessionStart.Load()
+	var sessionUptime time.Duration
+	if sessionStart > 0 && c.connected.Load() {
+		sessionUptime = time.Since(time.Unix(sessionStart, 0))
+	}
+
+	lastConnected := c.stats.lastConnected.Load()
+	var lastConnectedAt time.Time
+	if lastConnected > 0 {
+		lastConnectedAt = time.Unix(lastConnected, 0)
+	}
+
+	return Stats{
+		ActiveConnections:     c.stats.activeConns.Load(),
+		TotalConnections:      c.stats.totalConns.Load(),
+		PendingConnections:    c.stats.pendingConns.Load(),
+		BytesSentTotal:        c.stats.bytesSent.Load(),
+		BytesReceivedTotal:    c.stats.bytesRecv.Load(),
+		MessagesSentTotal:     c.stats.msgsSent.Load(),
+		MessagesReceivedTotal: c.stats.msgsRecv.Load(),
+		ControlQueueDepth:     len(c.controlSend),
+		DataQueueDepth:        dataQueueDepth,
+		DroppedConnections:    c.stats.droppedConns.Load(),
+		TransientErrors:       c.stats.transientErrors.Load(),
+		PermanentErrors:       c.stats.permanentErrors.Load(),
+		RateLimitHits:         c.stats.rateLimitHits.Load(),
+		EnqueueTimeouts:       c.stats.enqueueTimeouts.Load(),
+		PausedConnections:     c.stats.pausedConns.Load(),
+		PauseViolations:       c.stats.pauseViolations.Load(),
+		DroppedEvents:         c.stats.droppedEvents.Load(),
+		UDPDroppedPackets:     c.stats.udpDroppedPackets.Load(),
+		SessionUptime:         sessionUptime,
+		LastUpdated:           time.Now(),
+		ReconnectCount:        c.stats.reconnectCount.Load(),
+		LastConnectedAt:       lastConnectedAt,
+	}
+}
+
+// StatsDetailed returns stats including per-connection details.
+// This is a more expensive operation that iterates over all connections.
+// Results are cached for 1 second to prevent excessive CPU usage.
+func (c *Client) StatsDetailed() Stats {
+	c.statsCacheMu.RLock()
+	if time.Since(c.statsCacheTime) < statsCacheTTL {
+		cached := c.statsCache
+		c.statsCacheMu.RUnlock()
+		return cached
+	}
+	c.statsCacheMu.RUnlock()
+
+	// Compute fresh stats
+	stats := c.Stats()
+	stats.ConnectionStats = make(map[string]ConnectionStats)
+
+	c.localConns.Range(func(key, value interface{}) bool {
+		if conn, ok := value.(*clientConn); ok {
+			id := conn.id.String()
+			stats.ConnectionStats[id] = ConnectionStats{
+				ClientID:     id,
+				Hostname:     conn.hostname,
+				State:        ConnState(conn.state.Load()),
+				BufferLevel:  int(conn.flow.level.Load()),
+				Paused:       conn.flow.paused.Load(),
+				LastActivity: time.Unix(conn.lastActivity.Load(), 0),
+				IsUDP:        conn.isUDP,
+			}
+		}
+		return true
+	})
+
+	c.statsCacheMu.Lock()
+	c.statsCache = stats
+	c.statsCacheTime = time.Now()
+	c.statsCacheMu.Unlock()
+
+	return stats
+}
+
+// emit sends an event to the event handler asynchronously.
+// Events are delivered in order via a buffered channel.
+func (c *Client) emit(event Event) {
+	event.Timestamp = time.Now()
+	select {
+	case c.eventCh <- event:
+		// Successfully queued
+	default:
+		// Buffer full - drop event
+		c.stats.droppedEvents.Add(1)
+	}
+}
+
+// startEventDispatcher starts the goroutine that delivers events to the handler.
+func (c *Client) startEventDispatcher() {
+	// safeCallHandler wraps the event handler with panic recovery
+	safeCallHandler := func(event Event) {
+		if c.eventHandler == nil {
+			return
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("ERROR: [%s] Event handler panicked: %v", c.config.Name, r)
+			}
+		}()
+		c.eventHandler(event)
+	}
+
+	go func() {
+		for {
+			select {
+			case event, ok := <-c.eventCh:
+				if !ok {
+					return // Channel closed
+				}
+				safeCallHandler(event)
+			case <-c.ctx.Done():
+				// Drain remaining events before exiting
+				for {
+					select {
+					case event := <-c.eventCh:
+						safeCallHandler(event)
+					default:
+						return
+					}
+				}
+			}
+		}
+	}()
+}
+
 // Start initiates the client's connection loop.
 func (c *Client) Start(ctx context.Context) {
 	c.ctx, c.cancel = context.WithCancel(ctx)
 	defer c.cleanup()
 
 	log.Printf("INFO: [%s] Manager started for hostnames: %s", c.config.Name, strings.Join(c.config.Hostnames, ", "))
+
+	// Start the event dispatcher for async event delivery
+	c.startEventDispatcher()
 
 	// Start the health check pump to monitor connection health.
 	c.healthWg.Add(1)
@@ -257,7 +684,8 @@ func (c *Client) Start(ctx context.Context) {
 	// Start the network state watcher for fast recovery (Linux only, best-effort)
 	networkWakeup := c.watchNetworkState()
 
-	retries := 0
+	var transientRetries, permanentFailures int
+
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -266,61 +694,162 @@ func (c *Client) Start(ctx context.Context) {
 		default:
 		}
 
-		if err := c.connectAndAuthenticate(); err != nil {
-			delay := backoffDelay(retries)
-			log.Printf("WARN: [%s] Failed to connect and authenticate: %v. Retrying in %s (attempt %d)...", c.config.Name, err, delay.Round(time.Millisecond), retries+1)
-			retries++
+		err := c.connectAndAuthenticate()
+		if err == nil {
+			transientRetries = 0
+			permanentFailures = 0
+			c.stats.sessionStart.Store(time.Now().Unix())
+			c.stats.lastConnected.Store(time.Now().Unix())
+			c.stats.reconnectCount.Add(1)
+			c.emit(Event{Type: EventConnected})
+			log.Printf("INFO: [%s] Connection established and authenticated. Starting pumps.", c.config.Name)
 
-			// Wait for backoff delay, but allow early wakeup on network state change
-			select {
-			case <-c.ctx.Done():
-				return
-			case _, ok := <-networkWakeup:
-				if !ok {
-					// Channel closed (netlink watcher exited), disable network wakeup
-					networkWakeup = nil
-					log.Printf("DEBUG: [%s] Network watcher stopped, falling back to timer-based backoff", c.config.Name)
-					// Still honor the backoff delay for this iteration
-					select {
-					case <-c.ctx.Done():
-						return
-					case <-time.After(delay):
-					}
-				} else {
-					log.Printf("INFO: [%s] Network state changed, retrying immediately.", c.config.Name)
-					retries = 0 // Reset backoff on network change
-				}
-			case <-time.After(delay):
-				// Normal backoff delay elapsed
-			}
+			sessionCh := c.beginSession()
+			c.wg.Add(1)
+			go c.readPump()
+			c.wg.Add(1)
+			go c.writePump(sessionCh)
+
+			c.wg.Wait() // Wait for pumps to exit, indicating a disconnection.
+			c.clearSendQueues()
+			c.closeAllLocalConns() // Close all local connections; they can't be resumed across sessions
+
+			// Fix [P2]: Ensure we clear any stranded queues from the map to prevent memory leaks across sessions
+			c.connQueues.Range(func(key, value interface{}) bool {
+				c.connQueues.Delete(key)
+				return true
+			})
+
+			c.stats.sessionStart.Store(0)
+			c.emit(Event{Type: EventDisconnected})
+			log.Printf("INFO: [%s] Disconnected from Nexus Proxy.", c.config.Name)
 			continue
 		}
 
-		// Connection successful, reset retry counter
-		retries = 0
-		log.Printf("INFO: [%s] Connection established and authenticated. Starting pumps.", c.config.Name)
+		catErr := categorizeError(err)
+		var delay time.Duration
 
-		sessionCh := c.beginSession()
+		switch catErr.Category {
+		case ErrorTransient:
+			c.stats.transientErrors.Add(1)
+			delay = backoffDelay(transientRetries)
+			log.Printf("WARN: [%s] Transient error: %v. Retry %d in %s", c.config.Name, err, transientRetries+1, delay.Round(time.Millisecond))
+			transientRetries++
+		case ErrorPermanent:
+			c.stats.permanentErrors.Add(1)
+			permanentFailures++
+			if permanentFailures >= maxPermanentFailures {
+				log.Printf("ERROR: [%s] Permanent failure after %d attempts: %v. Stopping.", c.config.Name, permanentFailures, err)
+				c.emit(Event{Type: EventError, Error: err, Reason: "permanent_failure"})
+				return // Exit loop
+			}
+			delay = backoffDelay(permanentFailures)
+			log.Printf("ERROR: [%s] Permanent error: %v. Attempt %d/%d, retry in %s", c.config.Name, err, permanentFailures, maxPermanentFailures, delay.Round(time.Millisecond))
+		case ErrorRateLimit:
+			c.stats.rateLimitHits.Add(1)
+			delay = maxReconnectDelay
+			log.Printf("WARN: [%s] Rate limited. Backing off for %s", c.config.Name, delay)
+		}
+		c.emit(Event{Type: EventError, Error: err, Reason: catErr.Reason})
 
-		c.wg.Add(1)
-		go c.readPump()
-
-		c.wg.Add(1)
-		go c.writePump(sessionCh)
-
-		c.wg.Wait() // Wait for pumps to exit, indicating a disconnection.
-		c.clearSendQueue()
-		c.closeAllLocalConns() // Close all local connections; they can't be resumed across sessions
-		log.Printf("INFO: [%s] Disconnected from Nexus Proxy.", c.config.Name)
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(delay):
+		case _, ok := <-networkWakeup:
+			if !ok {
+				networkWakeup = nil
+				// fallback wait
+				select {
+				case <-c.ctx.Done():
+					return
+				case <-time.After(delay):
+				}
+			} else {
+				log.Printf("INFO: [%s] Network state changed, retrying immediately.", c.config.Name)
+				transientRetries = 0
+			}
+		}
 	}
 }
 
 // Stop gracefully shuts down the client and its connections.
 func (c *Client) Stop() {
 	log.Printf("INFO: [%s] Stopping client...", c.config.Name)
+
+	c.shuttingDown.Store(true)
+
+	// Graceful shutdown of local connections
+	c.localConns.Range(func(key, value interface{}) bool {
+		if conn, ok := value.(*clientConn); ok {
+			state := ConnState(conn.state.Load())
+			switch state {
+			case ConnStatePending:
+				c.transitionToClosed(conn, DisconnectShutdown)
+			case ConnStateActive:
+				if !conn.transition(ConnStateActive, ConnStateDraining) {
+					// State changed concurrently, assume closed or draining
+					return true
+				}
+				c.drainConnection(conn)
+			case ConnStateDraining, ConnStateClosed:
+				// Already handling
+			}
+		}
+		return true
+	})
+
+	// Wait for queues to drain with early exit if all drained
+	deadline := time.Now().Add(connectionDrainTimeout + 1*time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if c.queuesEmpty() && c.connectionsEmpty() {
+				log.Printf("DEBUG: [%s] All queues drained, proceeding with shutdown", c.config.Name)
+				goto forceClose
+			}
+			if time.Now().After(deadline) {
+				log.Printf("WARN: [%s] Drain timeout reached, forcing shutdown", c.config.Name)
+				goto forceClose
+			}
+		}
+	}
+
+forceClose:
 	if c.cancel != nil {
 		c.cancel()
 	}
+}
+
+// queuesEmpty returns true if all send queues are empty.
+func (c *Client) queuesEmpty() bool {
+	if len(c.controlSend) > 0 {
+		return false
+	}
+	empty := true
+	c.connQueues.Range(func(key, value interface{}) bool {
+		if ch, ok := value.(chan outboundMessage); ok {
+			if len(ch) > 0 {
+				empty = false
+				return false
+			}
+		}
+		return true
+	})
+	return empty
+}
+
+// connectionsEmpty returns true if all connections are closed.
+func (c *Client) connectionsEmpty() bool {
+	empty := true
+	c.localConns.Range(func(key, value interface{}) bool {
+		empty = false
+		return false
+	})
+	return empty
 }
 
 func (c *Client) getAuthToken(ctx context.Context) (string, error) {
@@ -410,9 +939,9 @@ func (c *Client) connectAndAuthenticate() error {
 func (c *Client) closeAllLocalConns() {
 	c.localConns.Range(func(key, value interface{}) bool {
 		if conn, ok := value.(*clientConn); ok {
-			conn.safeClose()
+			// Use transitionToClosed to ensure stats are updated and events emitted
+			c.transitionToClosed(conn, DisconnectSessionEnded)
 		}
-		c.localConns.Delete(key)
 		return true
 	})
 }
@@ -447,6 +976,10 @@ func (c *Client) readPump() {
 			}
 			return
 		}
+
+		// Track received message stats
+		c.stats.msgsRecv.Add(1)
+		c.stats.bytesRecv.Add(int64(len(message)))
 
 		ws.SetReadDeadline(time.Now().Add(pongWait))
 
@@ -516,10 +1049,28 @@ func (c *Client) handleControlMessage(payload []byte) {
 			hostname: normalizedHost,
 			quit:     make(chan struct{}),
 			writeCh:  make(chan []byte, localConnWriteBuffer),
+			flow: flowControl{
+				lowWaterMark:  c.config.FlowControl.LowWaterMark,
+				highWaterMark: c.config.FlowControl.HighWaterMark,
+				maxBuffer:     c.config.FlowControl.MaxBuffer,
+			},
+			isUDP: transport == TransportUDP,
 		}
-		pendingClient.pending.Store(true)
+		pendingClient.state.Store(uint32(ConnStatePending))
 		pendingClient.lastActivity.Store(time.Now().Unix())
 		c.localConns.Store(msg.ClientID, pendingClient)
+
+		// Create the per-connection queue upfront to avoid memory leaks from late-arriving data
+		c.getOrCreateQueue(msg.ClientID)
+
+		// Update stats
+		c.stats.pendingConns.Add(1)
+		c.stats.totalConns.Add(1)
+		c.emit(Event{
+			Type:     EventConnectionOpened,
+			ClientID: msg.ClientID.String(),
+			Hostname: normalizedHost,
+		})
 
 		// Spawn goroutine for dial to avoid blocking readPump
 		go c.establishLocalConnection(req, pendingClient)
@@ -531,8 +1082,7 @@ func (c *Client) handleControlMessage(payload []byte) {
 				if conn.hostname != "" {
 					log.Printf("DEBUG: [%s] Disconnecting client %s for hostname %s", c.config.Name, msg.ClientID, conn.hostname)
 				}
-				conn.safeClose()
-				c.localConns.Delete(msg.ClientID)
+				c.transitionToClosed(conn, DisconnectNormal)
 			}
 		}
 
@@ -614,19 +1164,14 @@ func (c *Client) establishLocalConnection(req ConnectRequest, pendingClient *cli
 			log.Printf("ERROR: [%s] Failed to establish local connection for client %s: %v", c.config.Name, req.ClientID, err)
 		}
 		// Clean up pending connection and notify Nexus
-		pendingClient.safeClose()
-		c.localConns.Delete(req.ClientID)
-		if err := c.sendControlMessage("disconnect", req.ClientID); err != nil {
-			log.Printf("DEBUG: [%s] Failed to send disconnect for client %s after dial failure: %v", c.config.Name, req.ClientID, err)
-		}
+		c.transitionToClosed(pendingClient, DisconnectDialFailed)
 		return
 	}
 
 	// Check if session is still active after dial (handles shutdown race)
 	if !c.connected.Load() {
 		conn.Close()
-		pendingClient.safeClose()
-		c.localConns.Delete(req.ClientID)
+		c.transitionToClosed(pendingClient, DisconnectShutdown)
 		log.Printf("DEBUG: [%s] Session ended during dial for client %s, closing connection", c.config.Name, req.ClientID)
 		return
 	}
@@ -638,7 +1183,7 @@ func (c *Client) establishLocalConnection(req ConnectRequest, pendingClient *cli
 		c.localConns.Delete(req.ClientID) // Ensure stale entry is removed
 		log.Printf("DEBUG: [%s] Pending connection closed during dial for client %s", c.config.Name, req.ClientID)
 		// Best-effort disconnect notification (may fail if session ended)
-		if err := c.sendControlMessage("disconnect", req.ClientID); err != nil {
+		if err := c.sendDisconnectMessage(req.ClientID, DisconnectShutdown); err != nil {
 			log.Printf("DEBUG: [%s] Failed to send disconnect for client %s after pending close: %v", c.config.Name, req.ClientID, err)
 		}
 		return
@@ -662,37 +1207,172 @@ func (c *Client) establishLocalConnection(req ConnectRequest, pendingClient *cli
 	default:
 	}
 
-	pendingClient.pending.Store(false)
+	if !pendingClient.transition(ConnStatePending, ConnStateActive) {
+		conn.Close()
+		log.Printf("DEBUG: [%s] Failed to transition from Pending to Active for client %s, closing connection", c.config.Name, req.ClientID)
+		return
+	}
 	pendingClient.lastActivity.Store(time.Now().Unix())
+
+	// Update stats: pending -> active
+	c.stats.pendingConns.Add(-1)
+	c.stats.activeConns.Add(1)
 
 	// Start reader (local -> Nexus) and writer (Nexus -> local) pumps
 	go c.copyLocalToNexus(pendingClient)
 	go c.writeToLocal(pendingClient)
 }
 
+// transitionToClosed transitions the connection to Closed state and performs cleanup.
+func (c *Client) transitionToClosed(conn *clientConn, reason DisconnectReason) {
+	// Attempt transition to Closed
+	// We allow transition from ANY state to Closed
+	// Loop to handle CAS
+	var fromState ConnState
+	for {
+		oldState := conn.state.Load()
+		if oldState == uint32(ConnStateClosed) {
+			return // Already closed
+		}
+		fromState = ConnState(oldState)
+		if conn.transition(fromState, ConnStateClosed) {
+			break
+		}
+	}
+
+	// Update stats based on previous state
+	switch fromState {
+	case ConnStatePending:
+		c.stats.pendingConns.Add(-1)
+	case ConnStateActive:
+		c.stats.activeConns.Add(-1)
+	case ConnStateDraining:
+		c.stats.activeConns.Add(-1) // Draining connections were counted as active
+	}
+
+	// Track dropped connections for non-normal reasons
+	if reason != DisconnectNormal {
+		c.stats.droppedConns.Add(1)
+	}
+
+	// Aggregate UDP dropped packets
+	if conn.isUDP {
+		dropped := conn.droppedPackets.Load()
+		if dropped > 0 {
+			c.stats.udpDroppedPackets.Add(dropped)
+		}
+	}
+
+	conn.safeClose()
+	c.cleanupConnectionQueue(conn.id)
+	c.localConns.Delete(conn.id)
+	if err := c.sendDisconnectMessage(conn.id, reason); err != nil {
+		log.Printf("DEBUG: [%s] Failed to send disconnect for client %s (%s): %v", c.config.Name, conn.id, reason, err)
+	}
+
+	// Emit connection closed event
+	c.emit(Event{
+		Type:     EventConnectionClosed,
+		ClientID: conn.id.String(),
+		Hostname: conn.hostname,
+		Reason:   string(reason),
+	})
+}
+
+func (c *Client) getOrCreateQueue(clientID uuid.UUID) chan outboundMessage {
+	if v, ok := c.connQueues.Load(clientID); ok {
+		return v.(chan outboundMessage)
+	}
+	queue := make(chan outboundMessage, 256)
+	actual, loaded := c.connQueues.LoadOrStore(clientID, queue)
+	if loaded {
+		return actual.(chan outboundMessage)
+	}
+	return queue
+}
+
+// getQueue returns the queue for a connection, or nil if not found.
+// Use this when you don't want to create a queue for stale notifications.
+func (c *Client) getQueue(clientID uuid.UUID) chan outboundMessage {
+	if v, ok := c.connQueues.Load(clientID); ok {
+		return v.(chan outboundMessage)
+	}
+	return nil
+}
+
+func (c *Client) cleanupConnectionQueue(clientID uuid.UUID) {
+	if v, ok := c.connQueues.LoadAndDelete(clientID); ok {
+		queue := v.(chan outboundMessage)
+		// Drain and discard any remaining messages
+		for {
+			select {
+			case <-queue:
+				// Discard message
+			default:
+				// Queue drained, done
+				return
+			}
+		}
+	}
+}
+
 // writeToLocal reads from the connection's write channel and writes to the local service.
 // This runs in a dedicated goroutine per connection to avoid blocking readPump.
 // Note: Cleanup (safeClose, localConns.Delete, disconnect message) is handled by copyLocalToNexus.
 func (c *Client) writeToLocal(client *clientConn) {
-	defer client.safeClose() // Trigger cleanup; copyLocalToNexus handles map deletion and disconnect
+	defer c.transitionToClosed(client, DisconnectNormal)
 
 	for {
 		select {
 		case <-client.quit:
 			return
 		case data := <-client.writeCh:
-			// Set write deadline to prevent indefinite blocking
+			// Set write deadline based on transport type
+			// UDP: short timeout (1ms) - drop if blocked
+			// TCP: longer timeout (10s) - connection health matters
+			writeTimeout := localWriteTimeout
+			if client.isUDP {
+				writeTimeout = 1 * time.Millisecond
+			}
 			if tc, ok := client.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
-				tc.SetWriteDeadline(time.Now().Add(localWriteTimeout))
+				tc.SetWriteDeadline(time.Now().Add(writeTimeout))
 			}
 			_, err := client.conn.Write(data)
 			if err != nil {
+				// UDP: Drop packet and continue (best-effort semantics)
+				if client.isUDP {
+					client.droppedPackets.Add(1)
+					continue
+				}
+				// TCP: Log and close connection
 				if client.hostname != "" {
 					log.Printf("ERROR: [%s] Failed to write data to local connection for ClientID %s (%s): %v", c.config.Name, client.id, client.hostname, err)
 				} else {
 					log.Printf("ERROR: [%s] Failed to write data to local connection for ClientID %s: %v", c.config.Name, client.id, err)
 				}
 				return
+			}
+
+			// TCP Flow Control: Update level and check for resume
+			if !client.isUDP {
+				newLevel := int(client.flow.level.Add(-1))
+				if client.flow.paused.Load() && newLevel <= client.flow.lowWaterMark {
+					client.flow.paused.Store(false)
+					c.stats.pausedConns.Add(-1)
+					c.enqueueControl(resumeStreamMessage(client.id))
+					c.emit(Event{
+						Type:     EventResumed,
+						ClientID: client.id.String(),
+						Hostname: client.hostname,
+					})
+				}
+			}
+
+			// Optimized Drain Check: If draining and no more data, exit immediately
+			if client.state.Load() == uint32(ConnStateDraining) {
+				if len(client.writeCh) == 0 {
+					return
+				}
 			}
 		}
 	}
@@ -713,25 +1393,68 @@ func (c *Client) handleDataMessage(payload []byte) {
 	val, ok := c.localConns.Load(clientID)
 	if ok {
 		if conn, ok := val.(*clientConn); ok {
+			state := ConnState(conn.state.Load())
+			// Fix [P1]: Allow Pending state to buffer data, otherwise we lose packets during dial
+			if state != ConnStateActive && state != ConnStatePending {
+				if state == ConnStateDraining {
+					log.Printf("DEBUG: Data received for draining connection %s, discarding", clientID)
+				}
+				return
+			}
+
 			conn.lastActivity.Store(time.Now().Unix()) // Reset activity timer
+
+			// UDP: Direct write when active, best-effort buffering when pending
+			if conn.isUDP {
+				if state == ConnStateActive && conn.conn != nil {
+					// Direct write with short timeout (UDP semantics: drop if blocked)
+					conn.conn.SetWriteDeadline(time.Now().Add(1 * time.Millisecond))
+					_, err := conn.conn.Write(data)
+					if err != nil {
+						conn.droppedPackets.Add(1)
+						// Don't close connection for UDP - just drop and continue
+					}
+					return
+				}
+				// Pending state: Best-effort buffering (no flow control for UDP)
+				select {
+				case conn.writeCh <- data:
+					// Buffered for delivery after dial completes
+				default:
+					// Buffer full - drop packet (UDP semantics)
+					conn.droppedPackets.Add(1)
+				}
+				return
+			}
+
+			// TCP: Flow control with pause/resume
+			currentLevel := int(conn.flow.level.Add(1))
+			if currentLevel >= conn.flow.highWaterMark && !conn.flow.paused.Load() {
+				conn.flow.paused.Store(true)
+				c.stats.pausedConns.Add(1)
+				c.enqueueControl(pauseStreamMessage(conn.id, "buffer_full"))
+				c.emit(Event{
+					Type:     EventPaused,
+					ClientID: conn.id.String(),
+					Hostname: conn.hostname,
+					Reason:   "buffer_full",
+				})
+			}
+
 			// Non-blocking enqueue to write channel
 			select {
 			case conn.writeCh <- data:
 				// Successfully enqueued
 			default:
-				// Write buffer full, connection is slow - close it
+				// Hard limit reached - this shouldn't happen if pause works correctly
+				conn.flow.level.Add(-1) // Revert the level increment
 				log.Printf("WARN: [%s] Write buffer full for ClientID %s, closing connection", c.config.Name, clientID)
-				conn.safeClose()
-				c.localConns.Delete(clientID)
-				// Notify Nexus that connection is closed
-				if err := c.sendControlMessage("disconnect", clientID); err != nil {
-					log.Printf("DEBUG: [%s] Failed to send disconnect for client %s after buffer overflow: %v", c.config.Name, clientID, err)
-				}
+				c.transitionToClosed(conn, DisconnectBufferFull)
 			}
 		}
 	} else {
 		log.Printf("WARN: [%s] No local connection found for ClientID %s. Data will be dropped. Disconnect will be sent to proxy", c.config.Name, clientID)
-		if err := c.sendControlMessage("disconnect", clientID); err != nil {
+		if err := c.sendDisconnectMessage(clientID, DisconnectUnknown); err != nil {
 			log.Printf("DEBUG: [%s] Failed to enqueue disconnect for ClientID %s: %v", c.config.Name, clientID, err)
 		}
 	}
@@ -739,17 +1462,8 @@ func (c *Client) handleDataMessage(payload []byte) {
 
 func (c *Client) copyLocalToNexus(client *clientConn) {
 	defer func() {
-		client.safeClose()
-		c.localConns.Delete(client.id)
-		if client.hostname != "" {
-			log.Printf("INFO: [%s] Cleaned up local connection for ClientID %s (%s)", c.config.Name, client.id, client.hostname)
-		} else {
-			log.Printf("INFO: [%s] Cleaned up local connection for ClientID %s", c.config.Name, client.id)
-		}
-
-		if err := c.sendControlMessage("disconnect", client.id); err != nil {
-			log.Printf("DEBUG: [%s] Failed to enqueue disconnect for ClientID %s: %v", c.config.Name, client.id, err)
-		}
+		// Use transitionToClosed to ensure consistent cleanup state
+		c.transitionToClosed(client, DisconnectNormal)
 	}()
 
 	buf := make([]byte, writeToNexusBufferSize)
@@ -781,7 +1495,7 @@ func (c *Client) copyLocalToNexus(client *clientConn) {
 				payload:     message,
 			}
 
-			if err := c.enqueue(outbound); err != nil {
+			if err := c.enqueueData(outbound); err != nil {
 				if !errors.Is(err, errSessionInactive) && !errors.Is(err, context.Canceled) {
 					log.Printf("WARN: [%s] Failed to enqueue data for ClientID %s: %v", c.config.Name, client.id, err)
 				}
@@ -791,10 +1505,20 @@ func (c *Client) copyLocalToNexus(client *clientConn) {
 	}
 }
 
-func (c *Client) clearSendQueue() {
+func (c *Client) clearSendQueues() {
+	// Drain control queue
 	for {
 		select {
-		case <-c.send:
+		case <-c.controlSend:
+		default:
+			goto drainDataReady
+		}
+	}
+drainDataReady:
+	// Drain dataReady channel (Fix [P3])
+	for {
+		select {
+		case <-c.dataReady:
 		default:
 			return
 		}
@@ -808,7 +1532,58 @@ func (c *Client) beginSession() chan struct{} {
 	return sessionCh
 }
 
-func (c *Client) enqueue(message outboundMessage) error {
+func (c *Client) enqueueData(message outboundMessage) error {
+	// Parse ClientID from message to ensure fair queuing
+	// message payload: [ControlByte(1) + ClientID(16) + Data...]
+	if len(message.payload) < 17 {
+		return fmt.Errorf("invalid data message length")
+	}
+	var clientID uuid.UUID
+	copy(clientID[:], message.payload[1:17])
+
+	// Use getQueue (not getOrCreateQueue) to avoid memory leaks from late-arriving data
+	// for closed connections. Queue is created upfront in handleControlMessage.
+	queue := c.getQueue(clientID)
+	if queue == nil {
+		// Connection already closed/cleaned up - drop the data
+		return fmt.Errorf("connection not found for ClientID %s", clientID)
+	}
+
+	select {
+	case queue <- message:
+		// Notify writePump using signaled flag to prevent duplicate notifications.
+		// The signaled flag ensures only one notification is in dataReady at a time
+		// per connection, preventing busy connections from flooding the channel.
+		if conn, ok := c.localConns.Load(clientID); ok {
+			if cConn, ok := conn.(*clientConn); ok {
+				if cConn.signaled.CompareAndSwap(false, true) {
+					// We own the notification responsibility - must push to dataReady
+					// Block here to apply backpressure (P3 fix: avoid unbounded goroutines)
+					select {
+					case c.dataReady <- clientID:
+						// Successfully notified
+					case <-c.ctx.Done():
+						// Context canceled, stop trying
+						cConn.signaled.Store(false) // Reset flag since we didn't notify
+					}
+				}
+				// If CAS failed, another notification is already pending - no action needed
+			}
+		}
+		return nil
+	case <-time.After(enqueueTimeout):
+		c.stats.enqueueTimeouts.Add(1)
+		return fmt.Errorf("enqueue timeout")
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	}
+}
+
+func (c *Client) enqueueControl(message outboundMessage) error {
+	return c.enqueue(message, c.controlSend)
+}
+
+func (c *Client) enqueue(message outboundMessage, queue chan outboundMessage) error {
 	if !c.connected.Load() {
 		return errSessionInactive
 	}
@@ -820,37 +1595,33 @@ func (c *Client) enqueue(message outboundMessage) error {
 		}
 	}
 
-	if c.ctx == nil {
-		if done != nil {
-			select {
-			case c.send <- message:
-				return nil
-			case <-done:
-				return errSessionInactive
-			}
-		}
-		c.send <- message
-		return nil
-	}
-
-	if done != nil {
-		select {
-		case c.send <- message:
-			return nil
-		case <-done:
-			return errSessionInactive
-		case <-c.ctx.Done():
-			return c.ctx.Err()
-		}
-	}
-
 	select {
-	case c.send <- message:
+	case queue <- message:
 		return nil
+	case <-time.After(enqueueTimeout):
+		c.stats.enqueueTimeouts.Add(1)
+		return fmt.Errorf("enqueue timeout")
+	case <-done:
+		return errSessionInactive
 	case <-c.ctx.Done():
 		return c.ctx.Err()
 	}
 }
+
+// DisconnectReason provides machine-readable reason codes for disconnect messages.
+type DisconnectReason string
+
+const (
+	DisconnectNormal        DisconnectReason = "normal"
+	DisconnectBufferFull    DisconnectReason = "buffer_full"
+	DisconnectDialFailed    DisconnectReason = "dial_failed"
+	DisconnectTimeout       DisconnectReason = "timeout"
+	DisconnectLocalError    DisconnectReason = "local_error"
+	DisconnectShutdown      DisconnectReason = "shutdown"
+	DisconnectSessionEnded  DisconnectReason = "session_ended"
+	DisconnectPauseViolated DisconnectReason = "pause_violated"
+	DisconnectUnknown       DisconnectReason = "unknown"
+)
 
 func (c *Client) sendControlMessage(event string, clientID uuid.UUID) error {
 	var msg struct {
@@ -872,7 +1643,7 @@ func (c *Client) sendControlMessage(event string, clientID uuid.UUID) error {
 		payload:     message,
 	}
 
-	if err := c.enqueue(outbound); err != nil {
+	if err := c.enqueueControl(outbound); err != nil {
 		if errors.Is(err, errSessionInactive) {
 			log.Printf("DEBUG: [%s] Dropping control message '%s' for client %s: session inactive", c.config.Name, event, clientID)
 		} else if errors.Is(err, context.Canceled) {
@@ -882,6 +1653,54 @@ func (c *Client) sendControlMessage(event string, clientID uuid.UUID) error {
 		}
 		return err
 	}
+	return nil
+}
+
+// sendDisconnectMessage sends a disconnect message with a reason code to Nexus.
+func (c *Client) sendDisconnectMessage(clientID uuid.UUID, reason DisconnectReason) error {
+	msg := struct {
+		Event    string           `json:"event"`
+		ClientID uuid.UUID        `json:"client_id"`
+		Reason   DisconnectReason `json:"reason"`
+	}{
+		Event:    "disconnect",
+		ClientID: clientID,
+		Reason:   reason,
+	}
+
+	payload, err := jsonMarshal(msg)
+	if err != nil {
+		log.Printf("ERROR: [%s] Failed to marshal disconnect for client %s: %v", c.config.Name, clientID, err)
+		return err
+	}
+	header := []byte{controlByteControl}
+	message := append(header, payload...)
+	outbound := outboundMessage{
+		messageType: websocket.BinaryMessage,
+		payload:     message,
+	}
+
+	if err := c.enqueueControl(outbound); err != nil {
+		if errors.Is(err, errSessionInactive) {
+			log.Printf("DEBUG: [%s] Dropping disconnect for client %s (%s): session inactive", c.config.Name, clientID, reason)
+		} else if errors.Is(err, context.Canceled) {
+			log.Printf("DEBUG: [%s] Dropping disconnect for client %s (%s): context canceled", c.config.Name, clientID, reason)
+		} else {
+			log.Printf("WARN: [%s] Failed to enqueue disconnect for client %s (%s): %v", c.config.Name, clientID, reason, err)
+		}
+		return err
+	}
+	return nil
+}
+
+func (c *Client) writeMessage(ws *websocket.Conn, message outboundMessage) error {
+	if err := ws.WriteMessage(message.messageType, message.payload); err != nil {
+		log.Printf("ERROR: [%s] Failed to write message to Nexus: %v", c.config.Name, err)
+		return err
+	}
+	// Track stats
+	c.stats.msgsSent.Add(1)
+	c.stats.bytesSent.Add(int64(len(message.payload)))
 	return nil
 }
 
@@ -900,7 +1719,7 @@ func (c *Client) writePump(sessionCh chan struct{}) {
 		c.connected.Store(false)
 		close(sessionCh)
 		c.sessionDone.Store((chan struct{})(nil))
-		c.clearSendQueue()
+		c.clearSendQueues()
 		if ws != nil {
 			ws.Close()
 		}
@@ -909,29 +1728,152 @@ func (c *Client) writePump(sessionCh chan struct{}) {
 	}()
 
 	for {
+		// Priority 1: Control messages
 		select {
-		case message, ok := <-c.send:
+		case message, ok := <-c.controlSend:
 			if !ok {
-				// The send channel was closed.
+				return
+			}
+			ws.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.writeMessage(ws, message); err != nil {
+				return
+			}
+			continue
+		default:
+		}
+
+		// Priority 2: Data messages (Fair Queuing)
+		select {
+		case message, ok := <-c.controlSend:
+			if !ok {
 				ws.SetWriteDeadline(time.Now().Add(writeWait))
 				ws.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 			ws.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := ws.WriteMessage(message.messageType, message.payload); err != nil {
-				log.Printf("ERROR: [%s] Failed to write message to Nexus: %v", c.config.Name, err)
-				return // Terminate the pump and session.
+			if err := c.writeMessage(ws, message); err != nil {
+				return
 			}
+		case clientID := <-c.dataReady:
+			c.drainConnectionQueue(ws, clientID, 4) // Drain up to 4 messages per turn
 		case <-ticker.C:
 			// Send a WebSocket-level ping to keep the connection alive.
 			if err := ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
 				log.Printf("ERROR: [%s] Failed to write ping to Nexus: %v", c.config.Name, err)
 				return // Terminate the pump and session.
 			}
+		case <-sessionCh:
+			return
 		case <-c.ctx.Done():
 			// The session context was canceled.
 			return
 		}
+	}
+}
+
+func (c *Client) drainConnectionQueue(ws *websocket.Conn, clientID uuid.UUID, maxMessages int) {
+	queue := c.getQueue(clientID)
+	if queue == nil {
+		// Stale notification - connection was already cleaned up
+		return
+	}
+
+	drained := 0
+	queueEmpty := false
+	for i := 0; i < maxMessages; i++ {
+		select {
+		case msg := <-queue:
+			ws.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.writeMessage(ws, msg); err != nil {
+				return // Write error will be caught by main loop ping or next write
+			}
+			drained++
+		default:
+			queueEmpty = true
+			goto cleanup // P0 fix: Don't return early, go through signaling cleanup
+		}
+	}
+
+cleanup:
+	conn, ok := c.localConns.Load(clientID)
+	if !ok {
+		return // Connection gone
+	}
+	cConn := conn.(*clientConn)
+
+	if queueEmpty || drained < maxMessages {
+		// Queue is empty - clear signaled flag so we can be notified again
+		cConn.signaled.Store(false)
+
+		// Race check: Use select to safely check if data arrived after we thought queue was empty
+		select {
+		case msg := <-queue:
+			// Race: new data arrived - send it immediately to preserve ordering
+			ws.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.writeMessage(ws, msg); err != nil {
+				return // Write error will be caught by main loop
+			}
+			// Re-signal since there might be more data
+			if cConn.signaled.CompareAndSwap(false, true) {
+				select {
+				case c.dataReady <- clientID:
+				default:
+					go func(id uuid.UUID) {
+						select {
+						case c.dataReady <- id:
+						case <-c.ctx.Done():
+						}
+					}(clientID)
+				}
+			}
+		default:
+			// Truly empty, signaled flag is cleared, we're done
+		}
+	} else {
+		// Processed maxMessages but queue may have more - re-queue for round-robin fairness
+		select {
+		case c.dataReady <- clientID:
+		default:
+			// Must not drop continuation signal
+			go func(id uuid.UUID) {
+				select {
+				case c.dataReady <- id:
+				case <-c.ctx.Done():
+				}
+			}(clientID)
+		}
+	}
+}
+
+func pauseStreamMessage(clientID uuid.UUID, reason string) outboundMessage {
+	msg := struct {
+		Event    string    `json:"event"`
+		ClientID uuid.UUID `json:"client_id"`
+		Reason   string    `json:"reason"`
+	}{
+		Event:    "pause_stream",
+		ClientID: clientID,
+		Reason:   reason,
+	}
+	payload, _ := json.Marshal(msg)
+	return outboundMessage{
+		messageType: websocket.BinaryMessage,
+		payload:     append([]byte{controlByteControl}, payload...),
+	}
+}
+
+func resumeStreamMessage(clientID uuid.UUID) outboundMessage {
+	msg := struct {
+		Event    string    `json:"event"`
+		ClientID uuid.UUID `json:"client_id"`
+	}{
+		Event:    "resume_stream",
+		ClientID: clientID,
+	}
+	payload, _ := json.Marshal(msg)
+	return outboundMessage{
+		messageType: websocket.BinaryMessage,
+		payload:     append([]byte{controlByteControl}, payload...),
 	}
 }
 
@@ -1066,8 +2008,11 @@ func (c *Client) handleReauthChallenge(nonce string) error {
 		ctx = context.Background()
 	}
 
+	c.emit(Event{Type: EventReauthStarted})
+
 	token, err := c.issueToken(ctx, StageReauth, nonce)
 	if err != nil {
+		c.emit(Event{Type: EventError, Error: err, Reason: "reauth_token_failed"})
 		return fmt.Errorf("issue reauth token: %w", err)
 	}
 
@@ -1076,8 +2021,11 @@ func (c *Client) handleReauthChallenge(nonce string) error {
 		payload:     []byte(token),
 	}
 
-	if err := c.enqueue(outbound); err != nil {
+	if err := c.enqueueControl(outbound); err != nil {
+		c.emit(Event{Type: EventError, Error: err, Reason: "reauth_enqueue_failed"})
 		return fmt.Errorf("enqueue reauth token: %w", err)
 	}
+
+	c.emit(Event{Type: EventReauthCompleted})
 	return nil
 }
