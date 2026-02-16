@@ -1478,6 +1478,29 @@ func (c *Client) copyLocalToNexus(client *clientConn) {
 			return
 		default:
 			n, err := client.conn.Read(buf)
+
+			// Per io.Reader contract, process n > 0 bytes before considering err.
+			if n > 0 {
+				client.lastActivity.Store(time.Now().Unix()) // Reset activity timer
+
+				header := make([]byte, 1+clientIDLength)
+				header[0] = controlByteData
+				copy(header[1:], client.id[:])
+				message := append(header, buf[:n]...)
+
+				outbound := outboundMessage{
+					messageType: websocket.BinaryMessage,
+					payload:     message,
+				}
+
+				if err := c.enqueueData(outbound); err != nil {
+					if !errors.Is(err, errSessionInactive) && !errors.Is(err, context.Canceled) {
+						log.Printf("WARN: [%s] Failed to enqueue data for ClientID %s: %v", c.config.Name, client.id, err)
+					}
+					return
+				}
+			}
+
 			if err != nil {
 				// safeClose guarantees close(quit) happens-before conn.Close(),
 				// so if quit is closed the error is from intentional teardown.
@@ -1491,24 +1514,6 @@ func (c *Client) copyLocalToNexus(client *clientConn) {
 							log.Printf("WARN: [%s] Error reading from local connection for ClientID %s: %v", c.config.Name, client.id, err)
 						}
 					}
-				}
-				return
-			}
-			client.lastActivity.Store(time.Now().Unix()) // Reset activity timer
-
-			header := make([]byte, 1+clientIDLength)
-			header[0] = controlByteData
-			copy(header[1:], client.id[:])
-			message := append(header, buf[:n]...)
-
-			outbound := outboundMessage{
-				messageType: websocket.BinaryMessage,
-				payload:     message,
-			}
-
-			if err := c.enqueueData(outbound); err != nil {
-				if !errors.Is(err, errSessionInactive) && !errors.Is(err, context.Canceled) {
-					log.Printf("WARN: [%s] Failed to enqueue data for ClientID %s: %v", c.config.Name, client.id, err)
 				}
 				return
 			}
@@ -1935,7 +1940,7 @@ func (c *Client) healthCheckPump() {
 							} else {
 								log.Printf("WARN: [%s] Did not receive pong for idle client %s within %s. Closing connection.", c.config.Name, conn.id, pongTimeout)
 							}
-							conn.safeClose() // This will trigger the full cleanup process.
+							c.transitionToClosed(conn, DisconnectTimeout)
 						}
 					})
 				}
