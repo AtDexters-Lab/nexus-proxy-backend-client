@@ -1344,11 +1344,16 @@ func (c *Client) writeToLocal(client *clientConn) {
 					client.droppedPackets.Add(1)
 					continue
 				}
-				// TCP: Log and close connection
-				if client.hostname != "" {
-					log.Printf("ERROR: [%s] Failed to write data to local connection for ClientID %s (%s): %v", c.config.Name, client.id, client.hostname, err)
-				} else {
-					log.Printf("ERROR: [%s] Failed to write data to local connection for ClientID %s: %v", c.config.Name, client.id, err)
+				// TCP: safeClose guarantees close(quit) happens-before conn.Close(),
+				// so if quit is closed the error is from intentional teardown.
+				select {
+				case <-client.quit:
+				default:
+					if client.hostname != "" {
+						log.Printf("ERROR: [%s] Failed to write data to local connection for ClientID %s (%s): %v", c.config.Name, client.id, client.hostname, err)
+					} else {
+						log.Printf("ERROR: [%s] Failed to write data to local connection for ClientID %s: %v", c.config.Name, client.id, err)
+					}
 				}
 				return
 			}
@@ -1474,11 +1479,17 @@ func (c *Client) copyLocalToNexus(client *clientConn) {
 		default:
 			n, err := client.conn.Read(buf)
 			if err != nil {
+				// safeClose guarantees close(quit) happens-before conn.Close(),
+				// so if quit is closed the error is from intentional teardown.
 				if err != io.EOF {
-					if client.hostname != "" {
-						log.Printf("WARN: [%s] Error reading from local connection for ClientID %s (%s): %v", c.config.Name, client.id, client.hostname, err)
-					} else {
-						log.Printf("WARN: [%s] Error reading from local connection for ClientID %s: %v", c.config.Name, client.id, err)
+					select {
+					case <-client.quit:
+					default:
+						if client.hostname != "" {
+							log.Printf("WARN: [%s] Error reading from local connection for ClientID %s (%s): %v", c.config.Name, client.id, client.hostname, err)
+						} else {
+							log.Printf("WARN: [%s] Error reading from local connection for ClientID %s: %v", c.config.Name, client.id, err)
+						}
 					}
 				}
 				return
