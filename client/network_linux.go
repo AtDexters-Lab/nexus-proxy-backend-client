@@ -34,7 +34,7 @@ type ifInfoMsg struct {
 // Returns a channel that receives a signal when a network interface comes up.
 // This is best-effort: if netlink setup fails, returns nil (falls back to timer-based backoff).
 func (c *Client) watchNetworkState() <-chan struct{} {
-	fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_DGRAM, syscall.NETLINK_ROUTE)
+	fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, syscall.NETLINK_ROUTE)
 	if err != nil {
 		log.Printf("DEBUG: [%s] Network state monitoring unavailable: %v (using timer-based backoff)", c.config.Name, err)
 		return nil
