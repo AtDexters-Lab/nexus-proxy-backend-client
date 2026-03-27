@@ -316,7 +316,8 @@ type clientConn struct {
 	pingSent     atomic.Bool  // True if an inactivity ping has been sent.
 	// pending      atomic.Bool  // Removed: replaced by state machine (ConnStatePending)
 	quit    chan struct{}
-	writeCh chan []byte // Buffered channel for non-blocking writes to local conn
+	drained chan struct{} // Closed by writePump when per-connection outbound queue is fully drained after close
+	writeCh chan []byte   // Buffered channel for non-blocking writes to local conn
 	// Flow control
 	flow flowControl
 
@@ -360,6 +361,19 @@ func (cc *clientConn) safeClose() {
 			conn.Close()
 		}
 	})
+}
+
+// closeOnDrained signals that the per-connection outbound queue has been fully
+// drained by writePump. Safe to call multiple times (idempotent).
+// Must only be called from writePump's drainConnectionQueue (single-caller
+// invariant ensures no concurrent close).
+func (cc *clientConn) closeOnDrained() {
+	select {
+	case <-cc.drained:
+		// Already closed
+	default:
+		close(cc.drained)
+	}
 }
 
 // cancelPongTimer stops the pong timeout timer if it's running.
@@ -1048,6 +1062,7 @@ func (c *Client) handleControlMessage(payload []byte) {
 			conn:     nil, // Set after dial completes
 			hostname: normalizedHost,
 			quit:     make(chan struct{}),
+			drained:  make(chan struct{}),
 			writeCh:  make(chan []byte, localConnWriteBuffer),
 			flow: flowControl{
 				lowWaterMark:  c.config.FlowControl.LowWaterMark,
@@ -1264,19 +1279,84 @@ func (c *Client) transitionToClosed(conn *clientConn, reason DisconnectReason) {
 	}
 
 	conn.safeClose()
-	c.cleanupConnectionQueue(conn.id)
-	c.localConns.Delete(conn.id)
-	if err := c.sendDisconnectMessage(conn.id, reason); err != nil {
-		log.Printf("DEBUG: [%s] Failed to send disconnect for client %s (%s): %v", c.config.Name, conn.id, reason, err)
+
+	// finalize performs cleanup. When sendDisconnect is true, it also notifies
+	// the relay. If the session ended (WebSocket closed), the relay already
+	// knows — sending a stale disconnect could leak onto a reconnected session.
+	finalize := func(sendDisconnect bool) {
+		c.cleanupConnectionQueue(conn.id)
+		c.localConns.Delete(conn.id)
+		if sendDisconnect {
+			if err := c.sendDisconnectMessage(conn.id, reason); err != nil {
+				log.Printf("DEBUG: [%s] Failed to send disconnect for client %s (%s): %v", c.config.Name, conn.id, reason, err)
+			}
+		}
+		c.emit(Event{
+			Type:     EventConnectionClosed,
+			ClientID: conn.id.String(),
+			Hostname: conn.hostname,
+			Reason:   string(reason),
+		})
 	}
 
-	// Emit connection closed event
-	c.emit(Event{
-		Type:     EventConnectionClosed,
-		ClientID: conn.id.String(),
-		Hostname: conn.hostname,
-		Reason:   string(reason),
-	})
+	// Only drain connections that were active and may have pending outbound data.
+	// Pending connections (dial in progress / dial failed) have no outbound queue.
+	needsDrain := fromState == ConnStateActive || fromState == ConnStateDraining
+
+	// Load session channel to detect writePump death.
+	var sessionDone <-chan struct{}
+	if needsDrain {
+		if v := c.sessionDone.Load(); v != nil {
+			if ch, ok := v.(chan struct{}); ok && ch != nil {
+				sessionDone = ch
+			}
+		}
+	}
+
+	if sessionDone != nil {
+		// Drain asynchronously to avoid blocking the caller — transitionToClosed
+		// can be called from readPump (e.g., relay-initiated disconnect) and must
+		// not stall the WebSocket reader while waiting for writePump to flush.
+		go func() {
+			// Signal writePump to drain this connection's outbound queue.
+			if conn.signaled.CompareAndSwap(false, true) {
+				select {
+				case c.dataReady <- conn.id:
+				case <-sessionDone:
+				case <-c.ctx.Done():
+				}
+			}
+
+			drainTimer := time.NewTimer(connectionDrainTimeout)
+			select {
+			case <-conn.drained:
+				// Re-check session liveness — if the session ended between
+				// drain completion and now, skip disconnect to avoid leaking
+				// a stale control frame onto a reconnected session.
+				select {
+				case <-sessionDone:
+					finalize(false)
+				default:
+					finalize(true)
+				}
+			case <-sessionDone:
+				// Session ended — relay already knows, skip disconnect.
+				log.Printf("WARN: [%s] Write pump exited during drain for ClientID %s", c.config.Name, conn.id)
+				finalize(false)
+			case <-drainTimer.C:
+				log.Printf("WARN: [%s] Drain timeout for ClientID %s, proceeding with disconnect", c.config.Name, conn.id)
+				finalize(true)
+			case <-c.ctx.Done():
+				// Client shutting down — relay connection is gone.
+				finalize(false)
+			}
+			drainTimer.Stop()
+		}()
+		return
+	}
+
+	// Pump is gone or connection was never active — clean up immediately.
+	finalize(true)
 }
 
 func (c *Client) getOrCreateQueue(clientID uuid.UUID) chan outboundMessage {
@@ -1817,6 +1897,11 @@ cleanup:
 	}
 	cConn := conn.(*clientConn)
 
+	// Log when drain actually flushed data for a closing connection (observability).
+	if drained > 0 && cConn.state.Load() == uint32(ConnStateClosed) {
+		log.Printf("INFO: [%s] Drained %d messages for ClientID %s before disconnect", c.config.Name, drained, clientID)
+	}
+
 	if queueEmpty || drained < maxMessages {
 		// Queue is empty - clear signaled flag so we can be notified again
 		cConn.signaled.Store(false)
@@ -1843,7 +1928,11 @@ cleanup:
 				}
 			}
 		default:
-			// Truly empty, signaled flag is cleared, we're done
+			// Truly empty, signaled flag is cleared.
+			// If connection is closed, signal that drain is complete.
+			if cConn.state.Load() == uint32(ConnStateClosed) {
+				cConn.closeOnDrained()
+			}
 		}
 	} else {
 		// Processed maxMessages but queue may have more - re-queue for round-robin fairness
